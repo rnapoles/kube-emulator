@@ -19,6 +19,7 @@ go build -o kube-emulator ./cmd/kube-emulator
 ./kube-emulator --storage=sqlite                  # persisted in ./kube-emulator.db
 ./kube-emulator --storage=sqlite --sqlite-path=/tmp/k8s.db --port=9000
 ./kube-emulator --write-kubeconfig=./emulator.kubeconfig
+./kube-emulator -nodes 3 -v --openapi-spec=./examples/swagger.json # To support kubectl explain
 ```
 
 ### kubectl
