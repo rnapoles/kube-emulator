@@ -38,5 +38,6 @@ var (
 	kStatefulSet = registry.KStatefulSets
 	kDaemonSets  = registry.KDaemonSets
 	kJobs        = registry.KJobs
+	kReplicationControllers = registry.KReplicationControllers
 	kCRDs        = registry.KCRDs
 )

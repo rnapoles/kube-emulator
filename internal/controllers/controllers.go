@@ -69,6 +69,7 @@ func (c *Controller) reconcileAll() {
 	c.ensureServiceAccounts()
 	c.each(kDeployments, c.syncDeployment)
 	c.each(kReplicaSets, c.syncReplicaSet)
+	c.each(kReplicationControllers, c.syncReplicationController)
 	c.each(kStatefulSet, c.syncStatefulSet)
 	c.each(kDaemonSets, c.syncDaemonSet)
 	c.each(kJobs, c.syncJob)
@@ -371,17 +372,12 @@ func (c *Controller) syncDeployment(du *U) {
 
 // ---------------------------------------------------------------- replica sets
 
-func (c *Controller) syncReplicaSet(ru *U) {
-	var rs appsv1.ReplicaSet
-	if err := fromU(ru, &rs); err != nil {
-		return
-	}
-	ns := ru.GetNamespace()
-	desired := 1
-	if rs.Spec.Replicas != nil {
-		desired = int(*rs.Spec.Replicas)
-	}
-	pods := activePods(c.ownedBy(kPods, ns, ru.GetUID()))
+// reconcilePods keeps exactly `desired` active pods owned by owner, creating
+// them from tmpl or deleting the newest ones. It returns the number of ready
+// pods (simulated pods are Running as soon as they are created).
+func (c *Controller) reconcilePods(owner *U, tmpl *corev1.PodTemplateSpec, namePrefix string, desired int) int {
+	ns := owner.GetNamespace()
+	pods := activePods(c.ownedBy(kPods, ns, owner.GetUID()))
 	sort.Slice(pods, func(i, j int) bool {
 		return pods[i].GetCreationTimestamp().Time.After(pods[j].GetCreationTimestamp().Time)
 	})
@@ -396,18 +392,48 @@ func (c *Controller) syncReplicaSet(ru *U) {
 		}
 	}
 	for i := len(pods); i < desired; i++ {
-		name := rs.Name + "-" + rand.String(5)
-		if err := c.createPod(ru, &rs.Spec.Template, name, "", nil, corev1.PodRunning); err != nil {
+		name := namePrefix + "-" + rand.String(5)
+		if err := c.createPod(owner, tmpl, name, "", nil, corev1.PodRunning); err != nil {
 			log.Printf("creating pod %s/%s: %v", ns, name, err)
 			continue
 		}
-		ready++ // simulated pods are Running immediately
+		ready++
 	}
+	return ready
+}
+
+func (c *Controller) syncReplicaSet(ru *U) {
+	var rs appsv1.ReplicaSet
+	if err := fromU(ru, &rs); err != nil {
+		return
+	}
+	desired := 1
+	if rs.Spec.Replicas != nil {
+		desired = int(*rs.Spec.Replicas)
+	}
+	ready := c.reconcilePods(ru, &rs.Spec.Template, rs.Name, desired)
 	status := appsv1.ReplicaSetStatus{
 		Replicas: int32(ready), FullyLabeledReplicas: int32(ready), ReadyReplicas: int32(ready),
 		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
 	}
-	c.setStatus(kReplicaSets, ns, rs.Name, statusMap(&status))
+	c.setStatus(kReplicaSets, ru.GetNamespace(), rs.Name, statusMap(&status))
+}
+
+func (c *Controller) syncReplicationController(ru *U) {
+	var rc corev1.ReplicationController
+	if err := fromU(ru, &rc); err != nil || rc.Spec.Template == nil {
+		return
+	}
+	desired := 1
+	if rc.Spec.Replicas != nil {
+		desired = int(*rc.Spec.Replicas)
+	}
+	ready := c.reconcilePods(ru, rc.Spec.Template, rc.Name, desired)
+	status := corev1.ReplicationControllerStatus{
+		Replicas: int32(ready), FullyLabeledReplicas: int32(ready), ReadyReplicas: int32(ready),
+		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
+	}
+	c.setStatus(kReplicationControllers, ru.GetNamespace(), rc.Name, statusMap(&status))
 }
 
 // ---------------------------------------------------------------- stateful sets

@@ -470,6 +470,11 @@ func scaleFor(u *U) map[string]interface{} {
 		}
 		selStr = labels.SelectorFromSet(set).String()
 	}
+	if selStr == "" { // ReplicationController: spec.selector is a plain label map
+		if m, ok, _ := unstructured.NestedStringMap(u.Object, "spec", "selector"); ok {
+			selStr = labels.SelectorFromSet(labels.Set(m)).String()
+		}
+	}
 	return map[string]interface{}{
 		"kind":       "Scale",
 		"apiVersion": "autoscaling/v1",

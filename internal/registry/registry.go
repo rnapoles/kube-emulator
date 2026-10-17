@@ -45,6 +45,7 @@ var (
 	KStatefulSets = rk("apps", "statefulsets")
 	KDaemonSets   = rk("apps", "daemonsets")
 	KJobs         = rk("batch", "jobs")
+	KReplicationControllers = rk("", "replicationcontrollers")
 	KCRDs         = rk("apiextensions.k8s.io", "customresourcedefinitions")
 )
 
@@ -102,6 +103,14 @@ func builtinResources() []*Resource {
 		{"", "v1", "persistentvolumeclaims", "persistentvolumeclaim", "PersistentVolumeClaim", true, []string{"pvc"}, nil, true, false},
 		{"", "v1", "resourcequotas", "resourcequota", "ResourceQuota", true, []string{"quota"}, nil, true, false},
 		{"", "v1", "limitranges", "limitrange", "LimitRange", true, []string{"limits"}, nil, false, false},
+		{"", "v1", "replicationcontrollers", "replicationcontroller", "ReplicationController", true, []string{"rc"}, all, true, true},
+		{"", "v1", "podtemplates", "podtemplate", "PodTemplate", true, nil, nil, false, false},
+		{"apps", "v1", "controllerrevisions", "controllerrevision", "ControllerRevision", true, nil, nil, false, false},
+		{"discovery.k8s.io", "v1", "endpointslices", "endpointslice", "EndpointSlice", true, nil, nil, false, false},
+		{"node.k8s.io", "v1", "runtimeclasses", "runtimeclass", "RuntimeClass", false, nil, nil, false, false},
+		{"storage.k8s.io", "v1", "csidrivers", "csidriver", "CSIDriver", false, nil, nil, false, false},
+		{"admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations", "validatingwebhookconfiguration", "ValidatingWebhookConfiguration", false, nil, nil, false, false},
+		{"admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations", "mutatingwebhookconfiguration", "MutatingWebhookConfiguration", false, nil, nil, false, false},
 		{"apps", "v1", "deployments", "deployment", "Deployment", true, []string{"deploy"}, all, true, true},
 		{"apps", "v1", "replicasets", "replicaset", "ReplicaSet", true, []string{"rs"}, all, true, true},
 		{"apps", "v1", "statefulsets", "statefulset", "StatefulSet", true, []string{"sts"}, all, true, true},

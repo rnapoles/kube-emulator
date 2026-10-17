@@ -112,7 +112,7 @@ func tableDefFor(res *Resource) tableDef {
 					fmt.Sprint(gi(u, "status", "updatedReplicas")), fmt.Sprint(gi(u, "status", "availableReplicas")), humanAge(u)}
 			},
 		}
-	case kReplicaSets:
+	case kReplicaSets, kReplicationControllers:
 		return tableDef{
 			cols: []colDef{cName,
 				{"Desired", "integer", "", "Number of desired pods."},

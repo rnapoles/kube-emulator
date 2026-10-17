@@ -159,6 +159,16 @@ func Normalize(obj k8sruntime.Object) {
 			o.Spec.ConcurrencyPolicy = batchv1.AllowConcurrent
 		}
 		defaultPodSpec(&o.Spec.JobTemplate.Spec.Template.Spec)
+	case *corev1.ReplicationController:
+		if o.Spec.Replicas == nil {
+			o.Spec.Replicas = ptr.To(int32(1))
+		}
+		if o.Spec.Template != nil {
+			if len(o.Spec.Selector) == 0 {
+				o.Spec.Selector = o.Spec.Template.Labels
+			}
+			defaultPodSpec(&o.Spec.Template.Spec)
+		}
 	case *corev1.Service:
 		if o.Spec.Type == "" {
 			o.Spec.Type = corev1.ServiceTypeClusterIP
@@ -398,6 +408,24 @@ func ValidateTyped(obj k8sruntime.Object) field.ErrorList {
 		errs := validateJobTemplate(&o.Spec.JobTemplate.Spec, fp.Child("jobTemplate", "spec"))
 		if f := strings.Fields(o.Spec.Schedule); !strings.HasPrefix(o.Spec.Schedule, "@") && len(f) != 5 {
 			errs = append(errs, field.Invalid(fp.Child("schedule"), o.Spec.Schedule, "must be a valid cron expression with 5 fields"))
+		}
+		return errs
+	case *corev1.ReplicationController:
+		if o.Spec.Template == nil {
+			return field.ErrorList{field.Required(fp.Child("template"), "")}
+		}
+		var errs field.ErrorList
+		if len(o.Spec.Selector) == 0 {
+			errs = append(errs, field.Required(fp.Child("selector"), ""))
+		} else if !labels.SelectorFromSet(o.Spec.Selector).Matches(labels.Set(o.Spec.Template.Labels)) {
+			errs = append(errs, field.Invalid(fp.Child("template", "metadata", "labels"), o.Spec.Template.Labels, "`selector` does not match template `labels`"))
+		}
+		if o.Spec.Replicas != nil && *o.Spec.Replicas < 0 {
+			errs = append(errs, field.Invalid(fp.Child("replicas"), *o.Spec.Replicas, "must be greater than or equal to 0"))
+		}
+		errs = append(errs, validatePodSpec(&o.Spec.Template.Spec, fp.Child("template", "spec"))...)
+		if rp := o.Spec.Template.Spec.RestartPolicy; rp != corev1.RestartPolicyAlways {
+			errs = append(errs, field.NotSupported(fp.Child("template", "spec", "restartPolicy"), rp, []string{"Always"}))
 		}
 		return errs
 	case *corev1.Service:

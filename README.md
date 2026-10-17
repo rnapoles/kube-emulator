@@ -114,12 +114,14 @@ selectors, `status` and `scale` subresources, `dryRun=All`, finalizers,
 `deletionTimestamp`, and CustomResourceDefinitions (create a CRD and its
 resources become available immediately).
 
-Built-in resources: namespaces, nodes, pods, services, configmaps, secrets,
+Built-in resources: namespaces, nodes, pods, replicationcontrollers, podtemplates, services, configmaps, secrets,
 serviceaccounts, endpoints, events, persistentvolumes(+claims), resourcequotas,
 limitranges, deployments, replicasets, statefulsets, daemonsets, jobs,
 cronjobs, horizontalpodautoscalers, ingresses, networkpolicies, ingressclasses,
 roles/rolebindings/clusterroles/clusterrolebindings, storageclasses,
-poddisruptionbudgets, priorityclasses, leases, customresourcedefinitions.
+poddisruptionbudgets, priorityclasses, leases, controllerrevisions, endpointslices,
+runtimeclasses, csidrivers, validating/mutatingwebhookconfigurations (stored only,
+never called), customresourcedefinitions.
 
 ## Known limitations
 
@@ -131,6 +133,9 @@ poddisruptionbudgets, priorityclasses, leases, customresourcedefinitions.
 * CronJobs are stored but never fire; HPAs are stored but never scale.
 * `kubectl exec`, `attach`, `port-forward` return 501; `kubectl logs` returns
   a placeholder line; `kubectl explain` does not work (no OpenAPI schemas).
-* One API version per group; no conversion between versions. Only JSON is
+* One API version per group; no conversion between versions. Manifests that use
+  an older apiVersion than the one served (for example `autoscaling/v1`
+  HorizontalPodAutoscaler instead of `autoscaling/v2`) are rejected with
+  "no matches for kind". Only JSON is
   served (no protobuf).
 * Pagination (`limit`/`continue`) is ignored; everything is returned at once.
