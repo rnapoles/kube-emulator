@@ -34,7 +34,7 @@ func main() {
 		storage  = flag.String("storage", "memory", `where objects are kept: "memory" or "sqlite"`)
 		dbPath   = flag.String("sqlite-path", "kube-emulator.db", "SQLite database file (used with --storage=sqlite)")
 		kubecfg  = flag.String("write-kubeconfig", "", "also write a kubeconfig that points at this server to the given file")
-		verbose  = flag.Bool("v", false, "log every request")
+		verbose  = flag.Bool("v", false, "verbose: dump every request (full headers and body) and log its duration")
 		showHelp = flag.Bool("h", false, "show help")
 	)
 	flag.Parse()

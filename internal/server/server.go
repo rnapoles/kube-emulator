@@ -7,6 +7,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"runtime"
 	"strconv"
@@ -120,6 +121,15 @@ func successStatus(res *Resource, obj *U) *metav1.Status {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	if s.verbose {
+		// DumpRequest(true) reads the body and puts an identical copy back,
+		// so the handlers below still see it.
+		if dump, err := httputil.DumpRequest(r, true); err != nil {
+			log.Printf("dumping request: %v", err)
+		} else {
+			log.Printf("---- request from %s ----\n%s\n---- end request ----", r.RemoteAddr, dump)
+		}
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("panic serving %s %s: %v", r.Method, r.URL.Path, rec)
@@ -169,12 +179,15 @@ func (s *Server) paths() []string {
 }
 
 func (s *Server) openAPIV2(w http.ResponseWriter, r *http.Request) {
+	// NOTE: the Accept header uses "@v1.0", but a response Content-Type must not
+	// contain "@" (client-go would fail with "mime: unexpected content after media
+	// subtype"), so the response uses "." like the real API server.
 	doc := []byte(`{"swagger":"2.0","info":{"title":"Kubernetes emulator","version":"` + registry.ServerVersion + `"},"paths":{},"definitions":{}}`)
 	if strings.Contains(r.Header.Get("Accept"), "protobuf") {
 		d, err := openapi_v2.ParseDocument(doc)
 		if err == nil {
 			if b, err := proto.Marshal(d); err == nil {
-				w.Header().Set("Content-Type", "application/com.github.proto-openapi.spec.v2@v1.0+protobuf")
+				w.Header().Set("Content-Type", "application/com.github.proto-openapi.spec.v2.v1.0+protobuf")
 				_, _ = w.Write(b)
 				return
 			}

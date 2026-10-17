@@ -26,7 +26,7 @@ go build -o kube-emulator ./cmd/kube-emulator
 | `--storage` | `memory` | `memory` or `sqlite` |
 | `--sqlite-path` | `kube-emulator.db` | database file for `--storage=sqlite` |
 | `--write-kubeconfig` | – | also write a kubeconfig pointing at the server |
-| `-v` | off | log every request |
+| `-v` | off | dump every request (full headers and body) and log its duration |
 
 ## Project layout
 
