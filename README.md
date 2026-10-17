@@ -30,6 +30,10 @@ go build -o kube-emulator ./cmd/kube-emulator
 | `--kinds-reload` | `2s` | how often the folder is re-scanned (`0` = only at start-up) |
 | `--openapi-spec` | – | `swagger.json` whose definitions power `kubectl explain` (see below) |
 | `--env-file` | `.env` | file with default settings (see below) |
+| `--nodes` | `1` | number of fake nodes `emulator-node-1..N` |
+| `--node-cpu`, `--node-memory`, `--node-pods` | `8`, `16Gi`, `110` | capacity of generated nodes (and default for nodes created without capacity) |
+| `--delays` | – | pod lifecycle delays, e.g. `pull=3s,ready=5s`, or `instant` |
+| `--seed-dir` | – | folder of manifests created at start-up when missing |
 | `-v` | off | dump every request (full headers and body) and log its duration |
 
 ## Project layout
@@ -46,6 +50,10 @@ kube-emulator/
     │   └── sqlite.go
     ├── registry/            # served resources (built-in + CRDs), discovery, OpenAPI stubs
     │   └── registry.go
+    ├── events/              # Event recorder (aggregation, like the real one)
+    │   └── events.go
+    ├── kubesim/             # fake nodes, scheduler, kubelet lifecycle simulation
+    │   ├── nodes.go  scheduler.go  predicates.go  kubelet.go  delays.go  common.go
     ├── config/              # .env parsing and flag/env/.env precedence
     │   └── dotenv.go
     ├── openapi/             # swagger.json definitions -> OpenAPI v2 / v3 documents (kubectl explain)
@@ -66,7 +74,7 @@ kube-emulator/
 ```
 
 Dependencies only point downwards: `main` -> `server`, `controllers` ->
-`openapi`, `objects` -> `registry` -> `store` (`config` is used by `main` only).
+`openapi`, `kubesim` (also used by `controllers`) -> `events` -> `objects` -> `registry` -> `store` (`config` is used by `main` only).
 
 ## Loading kinds from a folder (no code changes)
 
@@ -129,6 +137,12 @@ line endings; see `.env.example` for every key.
 | `--kinds-dir` | `KUBE_EMULATOR_KINDS_DIR` |
 | `--kinds-reload` | `KUBE_EMULATOR_KINDS_RELOAD` |
 | `--openapi-spec` | `KUBE_EMULATOR_OPENAPI_SPEC` |
+| `--nodes` | `KUBE_EMULATOR_NODES` |
+| `--node-cpu` | `KUBE_EMULATOR_NODE_CPU` |
+| `--node-memory` | `KUBE_EMULATOR_NODE_MEMORY` |
+| `--node-pods` | `KUBE_EMULATOR_NODE_PODS` |
+| `--delays` | `KUBE_EMULATOR_DELAYS` |
+| `--seed-dir` | `KUBE_EMULATOR_SEED_DIR` |
 | `-v` | `KUBE_EMULATOR_VERBOSE` |
 
 ## kubectl explain
@@ -155,6 +169,108 @@ kubectl explain pod --recursive
 * Use a swagger file from a Kubernetes version close to the emulator's reported
   version (v1.31). With a spec loaded, kubectl also validates manifests
   client-side against these schemas, as it does against a real cluster.
+
+## Nodes, scheduling, pod lifecycle and events
+
+Pods are no longer Running the instant they are created. A simulated scheduler
+and kubelets move them through a realistic life, and every step leaves events.
+
+### Fake nodes and the scheduler
+
+`--nodes=3` creates `emulator-node-1..3` (node 1 is labelled `control-plane`,
+the others `worker`; zones `zone-a/b/c` in turn). Nodes are ordinary Node
+objects: create more, with any labels, taints and capacity, using
+`kubectl apply` or `--seed-dir` (see `examples/scheduling/nodes.yaml`); a node
+created without status gets a Ready condition, addresses and the default
+capacity. `kubectl cordon`, `uncordon`, `taint`, `label` and `drain` work (drain
+evicts through `pods/eviction`; pod disruption budgets are not consulted).
+Deleting a node deletes its pods after ten seconds.
+
+The scheduler binds a pod to a node that passes all of these, then prefers
+nodes matching *preferred* node affinity and, after that, the node with the
+fewest pods:
+
+* not cordoned (`spec.unschedulable`) and Ready
+* `nodeSelector` and required node affinity (the real
+  `k8s.io/component-helpers` matcher, so all operators work)
+* taints: `NoSchedule` and `NoExecute` taints need a matching toleration
+* resources: the sum of container requests (limits count as requests,
+  init containers as a maximum) must fit the node's allocatable minus what is
+  already placed, including extended resources such as `nvidia.com/gpu`, and
+  the pod count limit
+* required pod affinity and anti-affinity with any `topologyKey`
+
+A pod that fits nowhere stays `Pending` with `PodScheduled=False` and a
+`FailedScheduling` event such as `0/3 nodes are available: 1 node(s) had
+untolerated taint {dedicated: gpu}, 2 Insufficient cpu.` It is retried
+continuously, so it is bound as soon as you add a node, uncordon or remove a
+taint. Not supported: topology spread constraints, preemption/priorities,
+`NoExecute` eviction of running pods, and the DaemonSet `maxUnavailable` logic.
+
+### Pod lifecycle
+
+`Pending` (scheduling) -> `ContainerCreating` (image pull) -> `Running`
+(not ready) -> `Ready`, with these default delays, which `--delays` changes
+(`--delays=instant` removes all waiting):
+
+| name | default | meaning |
+|---|---|---|
+| `schedule` | `300ms` | Pending until the scheduler binds the pod |
+| `pull` | `1s` | image pull (`ContainerCreating`) |
+| `start` | `300ms` | container creation after the pull |
+| `ready` | `1s` | Running until the readiness probe succeeds |
+| `job` | `3s` | how long pods of Jobs (`restartPolicy` Never/OnFailure) run before they complete |
+| `terminate` | `1s` | `Terminating` until the pod is gone (never longer than its grace period) |
+| `backoff` | `10s` | first back-off of `CrashLoopBackOff`/`ImagePullBackOff`; doubles up to 5m |
+
+Annotations on a pod (put them in the pod *template* of a Deployment, Job, ...)
+override the delays and inject failures; see `examples/lifecycle/pods.yaml`:
+
+| annotation | effect |
+|---|---|
+| `emulator.kube/delay-<name>: 5s` | overrides one delay (`schedule`, `pull`, `start`, `ready`, `job`, `terminate`, `backoff`) for this pod |
+| `emulator.kube/fail-image-pull: "true"` | `ErrImagePull` <-> `ImagePullBackOff` forever |
+| `emulator.kube/crash: "true"` | the container exits and is restarted with growing back-off (`CrashLoopBackOff`, `restartCount` rises); with `restartPolicy: Never` the pod becomes `Failed` |
+| `emulator.kube/crash-after: 2s` | how long it runs before crashing (default `1s`) |
+| `emulator.kube/crash-exit-code: "3"` | exit code reported in `lastState` (default `1`) |
+| `emulator.kube/fail-readiness: "true"` | Running but never Ready, with `Unhealthy` events |
+
+Deleting a pod is graceful: it shows `Terminating`, the kubelet emits `Killing`
+and the pod disappears after the `terminate` delay (`kubectl delete pod x
+--force --grace-period=0` removes it at once). To make this work, every pod
+carries the finalizer `emulator.kube/kubelet`, which you will see in
+`kubectl get pod -o yaml`.
+
+Controllers follow the real pod state: ReplicaSet/Deployment/StatefulSet/
+DaemonSet status uses *ready* pods, so `kubectl rollout status` waits for
+readiness. Deployments roll out gradually with `maxSurge`/`maxUnavailable`
+(or `Recreate`): a new version whose pods never become ready stalls while the
+old pods keep serving. StatefulSets create pods in order (`OrderedReady`) and
+update them from the highest ordinal. Jobs honour `completions`, `parallelism`
+and `backoffLimit` (failed pods count; `BackoffLimitExceeded` fails the job),
+and Services only list *ready* pods as endpoints (others appear under
+`notReadyAddresses`).
+
+### Events
+
+`kubectl describe` and `kubectl get events` show what happened, with the same
+reasons as a real cluster: `Scheduled`, `FailedScheduling`, `Pulling`,
+`Pulled`, `Created`, `Started`, `Killing`, `BackOff`, `Failed`, `Unhealthy`, and
+from the controllers `ScalingReplicaSet`, `SuccessfulCreate`,
+`SuccessfulDelete`, `Completed`, `BackoffLimitExceeded`. Repeated events are
+aggregated (`count`, `lastTimestamp`), events expire after an hour, and
+`kubectl get pods -o wide` shows IP and node.
+
+```bash
+./kube-emulator --nodes=3 --seed-dir=./examples/scheduling
+kubectl get nodes -o wide
+kubectl apply -f examples/scheduling/pods.yaml
+kubectl get pods -o wide
+kubectl describe pod too-big
+kubectl apply -f examples/lifecycle/pods.yaml
+kubectl get pods -w
+kubectl get events --sort-by=.lastTimestamp
+```
 
 ## Using kubectl
 
@@ -193,8 +309,8 @@ If `kubectl` complains about validation or stale discovery data, try
   and watch support. With `--storage=sqlite` every write is also written to
   SQLite (one JSON document per object) before it is acknowledged, and the
   state is reloaded on start-up.
-* **Simulation instead of containers** (`controllers.go`): pods are bound to a
-  fake node `emulator-node` and are immediately `Running` with a fake IP;
+* **Simulation instead of containers** (`kubesim` and `controllers`): a scheduler
+  binds pods to fake nodes and kubelets walk them through their lifecycle;
   Deployments create ReplicaSets (with revisions and rollouts), ReplicaSets
   create pods, StatefulSets, DaemonSets and Jobs are simulated, Services get
   cluster IPs / node ports and Endpoints, and deleting an owner or a namespace
@@ -226,7 +342,8 @@ never called), customresourcedefinitions.
   are implemented, so some invalid objects that a real cluster rejects are
   accepted here.
 * Server-side apply does not track field ownership (`managedFields`).
-* CronJobs are stored but never fire; HPAs are stored but never scale.
+* CronJobs are stored but never fire; HPAs are stored but never scale. Pod
+  disruption budgets and topology spread constraints are not enforced.
 * `kubectl exec`, `attach`, `port-forward` return 501; `kubectl logs` returns
   a placeholder line; `kubectl explain` only works for built-in kinds when `--openapi-spec` is given.
 * One API version per group; no conversion between versions. Manifests that use

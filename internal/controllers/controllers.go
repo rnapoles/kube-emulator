@@ -22,9 +22,12 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/utils/ptr"
 
+	"github.com/rnapoles/kube-emulator/internal/events"
+	"github.com/rnapoles/kube-emulator/internal/kubesim"
 	"github.com/rnapoles/kube-emulator/internal/objects"
 	"github.com/rnapoles/kube-emulator/internal/store"
 )
@@ -38,12 +41,16 @@ var (
 
 // ---------------------------------------------------------------- controller loop
 
+// Controller runs the workload controllers (Deployment, ReplicaSet,
+// ReplicationController, StatefulSet, DaemonSet, Job), the endpoints
+// controller and garbage collection. Pods are only created here; the
+// scheduler and kubelet simulation (package kubesim) move them forward.
 type Controller struct {
-	st   *store.Store
-	ipam *objects.IPAM
+	st *store.Store
+	ev *events.Recorder
 }
 
-func New(st *store.Store, ipam *objects.IPAM) *Controller { return &Controller{st: st, ipam: ipam} }
+func New(st *store.Store, ev *events.Recorder) *Controller { return &Controller{st: st, ev: ev} }
 
 func (c *Controller) Run(ctx context.Context) {
 	t := time.NewTicker(3 * time.Second)
@@ -88,16 +95,20 @@ func (c *Controller) each(key ResourceKey, fn func(*U)) {
 
 // ---------------------------------------------------------------- helpers
 
-func (c *Controller) createTyped(key ResourceKey, obj k8sruntime.Object, gvk schema.GroupVersionKind) error {
+func (c *Controller) createTyped(key ResourceKey, obj k8sruntime.Object, gvk schema.GroupVersionKind) (*U, error) {
 	u, err := toU(obj, gvk)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	initMeta(u)
-	if _, err := c.st.Create(key, u); err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
+	created, err := c.st.Create(key, u)
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return nil
+	return created, nil
 }
 
 func (c *Controller) mutate(key ResourceKey, ns, name string, fn func(cur *U) bool) {
@@ -122,15 +133,29 @@ func (c *Controller) setStatus(key ResourceKey, ns, name string, status map[stri
 	})
 }
 
-func (c *Controller) setReplicas(key ResourceKey, u *U, n int32) {
+// setReplicas changes spec.replicas. It reports whether it changed anything
+// and the previous value.
+func (c *Controller) setReplicas(key ResourceKey, u *U, n int32) (changed bool, old int64) {
 	c.mutate(key, u.GetNamespace(), u.GetName(), func(cur *U) bool {
-		if old, found, _ := unstructured.NestedInt64(cur.Object, "spec", "replicas"); found && old == int64(n) {
+		o, found, _ := unstructured.NestedInt64(cur.Object, "spec", "replicas")
+		if found && o == int64(n) {
 			return false
 		}
+		old = o
 		_ = unstructured.SetNestedField(cur.Object, int64(n), "spec", "replicas")
 		cur.SetGeneration(cur.GetGeneration() + 1)
+		changed = true
 		return true
 	})
+	return
+}
+
+func specReplicas(u *U) int32 {
+	v, found, _ := unstructured.NestedInt64(u.Object, "spec", "replicas")
+	if !found {
+		return 1
+	}
+	return int32(v)
 }
 
 func statusMap(v interface{}) map[string]interface{} {
@@ -174,6 +199,17 @@ func activePods(pods []*U) []*U {
 
 func podPhase(u *U) string { return gs(u, "status", "phase") }
 
+// isReady reports whether the pod has the Ready condition.
+func isReady(u *U) bool {
+	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	for _, cd := range conds {
+		if m, ok := cd.(map[string]interface{}); ok && m["type"] == "Ready" && m["status"] == "True" {
+			return true
+		}
+	}
+	return false
+}
+
 func templateHash(t *corev1.PodTemplateSpec) string {
 	b, _ := json.Marshal(t)
 	h := fnv.New32a()
@@ -186,7 +222,9 @@ func revisionOf(u *U) int64 {
 	return n
 }
 
-func (c *Controller) createPod(owner *U, tmpl *corev1.PodTemplateSpec, name, node string, extra map[string]string, phase corev1.PodPhase) error {
+// createPod creates a Pending pod from a template; the scheduler binds it
+// (unless node is given) and the kubelet simulation starts it.
+func (c *Controller) createPod(owner *U, tmpl *corev1.PodTemplateSpec, name, node string, extra map[string]string) error {
 	pod := &corev1.Pod{ObjectMeta: *tmpl.ObjectMeta.DeepCopy(), Spec: *tmpl.Spec.DeepCopy()}
 	pod.Name = name
 	pod.GenerateName = ""
@@ -207,7 +245,7 @@ func (c *Controller) createPod(owner *U, tmpl *corev1.PodTemplateSpec, name, nod
 		return err
 	}
 	initMeta(u)
-	if err := objects.SimulatePod(c.ipam, u, phase); err != nil {
+	if err := objects.PreparePod(u); err != nil {
 		return err
 	}
 	_, err = c.st.Create(kPods, u)
@@ -224,9 +262,91 @@ func (c *Controller) ensureServiceAccounts() {
 		}
 		if _, err := c.st.Get(kSAs, ns.GetName(), "default"); apierrors.IsNotFound(err) {
 			sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: ns.GetName()}}
-			_ = c.createTyped(kSAs, sa, gvkSA)
+			_, _ = c.createTyped(kSAs, sa, gvkSA)
 		}
 	}
+}
+
+// ---------------------------------------------------------------- pod sets
+
+// reconcilePods keeps `desired` active pods owned by owner: it creates pods
+// from tmpl or deletes the least useful ones (unscheduled, then not ready,
+// then newest). It returns how many pods exist and how many are ready.
+func (c *Controller) reconcilePods(owner *U, tmpl *corev1.PodTemplateSpec, namePrefix, component string, desired int) (total, ready int) {
+	ns := owner.GetNamespace()
+	pods := activePods(c.ownedBy(kPods, ns, owner.GetUID()))
+	rank := func(p *U) int {
+		switch {
+		case gs(p, "spec", "nodeName") == "":
+			return 0
+		case !isReady(p):
+			return 1
+		}
+		return 2
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		if ri, rj := rank(pods[i]), rank(pods[j]); ri != rj {
+			return ri < rj
+		}
+		return pods[i].GetCreationTimestamp().Time.After(pods[j].GetCreationTimestamp().Time)
+	})
+	for len(pods) > desired {
+		victim := pods[0]
+		pods = pods[1:]
+		if _, _, err := c.st.Delete(kPods, ns, victim.GetName()); err == nil {
+			c.ev.Eventf(owner, events.Normal, "SuccessfulDelete", component, "", "Deleted pod: %s", victim.GetName())
+		}
+	}
+	for _, p := range pods {
+		if isReady(p) {
+			ready++
+		}
+	}
+	total = len(pods)
+	for i := len(pods); i < desired; i++ {
+		name := namePrefix + "-" + rand.String(5)
+		if err := c.createPod(owner, tmpl, name, "", nil); err != nil {
+			log.Printf("creating pod %s/%s: %v", ns, name, err)
+			continue
+		}
+		c.ev.Eventf(owner, events.Normal, "SuccessfulCreate", component, "", "Created pod: %s", name)
+		total++
+	}
+	return total, ready
+}
+
+func (c *Controller) syncReplicaSet(ru *U) {
+	var rs appsv1.ReplicaSet
+	if err := fromU(ru, &rs); err != nil {
+		return
+	}
+	desired := 1
+	if rs.Spec.Replicas != nil {
+		desired = int(*rs.Spec.Replicas)
+	}
+	total, ready := c.reconcilePods(ru, &rs.Spec.Template, rs.Name, "replicaset-controller", desired)
+	status := appsv1.ReplicaSetStatus{
+		Replicas: int32(total), FullyLabeledReplicas: int32(total), ReadyReplicas: int32(ready),
+		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
+	}
+	c.setStatus(kReplicaSets, ru.GetNamespace(), rs.Name, statusMap(&status))
+}
+
+func (c *Controller) syncReplicationController(ru *U) {
+	var rc corev1.ReplicationController
+	if err := fromU(ru, &rc); err != nil || rc.Spec.Template == nil {
+		return
+	}
+	desired := 1
+	if rc.Spec.Replicas != nil {
+		desired = int(*rc.Spec.Replicas)
+	}
+	total, ready := c.reconcilePods(ru, rc.Spec.Template, rc.Name, "replication-controller", desired)
+	status := corev1.ReplicationControllerStatus{
+		Replicas: int32(total), FullyLabeledReplicas: int32(total), ReadyReplicas: int32(ready),
+		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
+	}
+	c.setStatus(kReplicationControllers, ru.GetNamespace(), rc.Name, statusMap(&status))
 }
 
 // ---------------------------------------------------------------- deployments
@@ -245,15 +365,51 @@ func setDeployCond(conds *[]appsv1.DeploymentCondition, t appsv1.DeploymentCondi
 	*conds = append(*conds, appsv1.DeploymentCondition{Type: t, Status: status, Reason: reason, Message: msg, LastUpdateTime: now, LastTransitionTime: now})
 }
 
+func rollingParams(d *appsv1.Deployment, desired int32) (surge, unavailable int32) {
+	ms, mu := intstr.FromString("25%"), intstr.FromString("25%")
+	if ru := d.Spec.Strategy.RollingUpdate; ru != nil {
+		if ru.MaxSurge != nil {
+			ms = *ru.MaxSurge
+		}
+		if ru.MaxUnavailable != nil {
+			mu = *ru.MaxUnavailable
+		}
+	}
+	s, _ := intstr.GetScaledValueFromIntOrPercent(&ms, int(desired), true)
+	u, _ := intstr.GetScaledValueFromIntOrPercent(&mu, int(desired), false)
+	if s == 0 && u == 0 {
+		u = 1
+	}
+	return int32(s), int32(u)
+}
+
+func (c *Controller) scaleRS(du, rs *U, n int32) {
+	changed, old := c.setReplicas(kReplicaSets, rs, n)
+	if !changed {
+		return
+	}
+	verb := "up"
+	if int64(n) < old {
+		verb = "down"
+	}
+	c.ev.Eventf(du, events.Normal, "ScalingReplicaSet", "deployment-controller", "",
+		"Scaled %s replica set %s to %d from %d", verb, rs.GetName(), n, old)
+}
+
+type rsView struct {
+	u           *U
+	spec, avail int32
+}
+
 func (c *Controller) syncDeployment(du *U) {
 	var d appsv1.Deployment
 	if err := fromU(du, &d); err != nil || d.Spec.Selector == nil {
 		return
 	}
 	ns := du.GetNamespace()
-	replicas := int32(1)
+	desired := int32(1)
 	if d.Spec.Replicas != nil {
-		replicas = *d.Spec.Replicas
+		desired = *d.Spec.Replicas
 	}
 	hash := templateHash(&d.Spec.Template)
 	rsName := d.Name + "-" + hash
@@ -261,12 +417,15 @@ func (c *Controller) syncDeployment(du *U) {
 
 	var maxRev int64
 	var newRS *U
+	var old []*U
 	for _, r := range rss {
 		if rev := revisionOf(r); rev > maxRev {
 			maxRev = rev
 		}
 		if r.GetName() == rsName {
 			newRS = r
+		} else {
+			old = append(old, r)
 		}
 	}
 	if newRS == nil {
@@ -281,53 +440,101 @@ func (c *Controller) syncDeployment(du *U) {
 		}
 		sel.MatchLabels["pod-template-hash"] = hash
 		maxRev++
+		zero := int32(0) // scaled up by the rollout logic below
 		rs := &appsv1.ReplicaSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: rsName, Namespace: ns, Labels: tmpl.Labels,
 				Annotations:     map[string]string{revisionAnnotation: strconv.FormatInt(maxRev, 10)},
 				OwnerReferences: []metav1.OwnerReference{controllerRef(du)},
 			},
-			Spec: appsv1.ReplicaSetSpec{Replicas: &replicas, Selector: sel, Template: *tmpl},
+			Spec: appsv1.ReplicaSetSpec{Replicas: &zero, Selector: sel, Template: *tmpl},
 		}
-		if err := c.createTyped(kReplicaSets, rs, gvkReplicaSet); err != nil {
+		created, err := c.createTyped(kReplicaSets, rs, gvkReplicaSet)
+		if err != nil {
 			log.Printf("creating ReplicaSet %s/%s: %v", ns, rsName, err)
+			return
+		}
+		if created == nil {
+			return
+		}
+		newRS = created
+		rss = append(rss, created)
+	} else if revisionOf(newRS) != maxRev { // rolled back to an older template
+		maxRev++
+		want := strconv.FormatInt(maxRev, 10)
+		c.mutate(kReplicaSets, ns, rsName, func(cur *U) bool {
+			a := cur.GetAnnotations()
+			if a == nil {
+				a = map[string]string{}
+			}
+			a[revisionAnnotation] = want
+			cur.SetAnnotations(a)
+			return true
+		})
+	}
+
+	// ---- rollout: surge the new ReplicaSet up and the old ones down, step by step
+	sort.Slice(old, func(i, j int) bool { return revisionOf(old[i]) < revisionOf(old[j]) })
+	minAvail := desired
+	var newTarget int32
+	if d.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		minAvail = 0
+		var oldPods int64
+		for _, r := range old {
+			oldPods += gi(r, "status", "replicas") + int64(specReplicas(r))
+			c.scaleRS(du, r, 0)
+		}
+		if oldPods == 0 {
+			newTarget = desired
 		}
 	} else {
-		c.setReplicas(kReplicaSets, newRS, replicas)
-		if revisionOf(newRS) != maxRev { // rollback to an older template
-			maxRev++
-			want := strconv.FormatInt(maxRev, 10)
-			c.mutate(kReplicaSets, ns, rsName, func(cur *U) bool {
-				a := cur.GetAnnotations()
-				if a == nil {
-					a = map[string]string{}
-				}
-				a[revisionAnnotation] = want
-				cur.SetAnnotations(a)
-				return true
-			})
+		surge, unavail := rollingParams(&d, desired)
+		minAvail = max(desired-unavail, 0)
+		views := make([]rsView, len(old))
+		var oldSpec int32
+		for i, r := range old {
+			v := rsView{u: r, spec: specReplicas(r), avail: int32(gi(r, "status", "availableReplicas"))}
+			if v.spec > v.avail { // replicas that never became available go first
+				c.scaleRS(du, r, v.avail)
+				v.spec = v.avail
+			}
+			views[i] = v
+			oldSpec += v.spec
+		}
+		newSpec := specReplicas(newRS)
+		if newSpec > desired {
+			newTarget = desired
+		} else {
+			allowed := max(desired+surge-(newSpec+oldSpec), 0)
+			newTarget = min(desired, newSpec+allowed)
+		}
+		newAvail := min(int32(gi(newRS, "status", "availableReplicas")), newTarget)
+		maxDown := newTarget + oldSpec - minAvail - (newTarget - newAvail)
+		for _, v := range views {
+			if maxDown <= 0 {
+				break
+			}
+			if dec := min(v.spec, maxDown); dec > 0 {
+				c.scaleRS(du, v.u, v.spec-dec)
+				maxDown -= dec
+			}
 		}
 	}
-	var old []*U
-	for _, r := range rss {
-		if r.GetName() != rsName {
-			c.setReplicas(kReplicaSets, r, 0)
-			old = append(old, r)
-		}
-	}
+	c.scaleRS(du, newRS, newTarget)
+
 	// keep at most revisionHistoryLimit old ReplicaSets
 	limit := 10
 	if d.Spec.RevisionHistoryLimit != nil {
 		limit = int(*d.Spec.RevisionHistoryLimit)
 	}
-	sort.Slice(old, func(i, j int) bool { return revisionOf(old[i]) < revisionOf(old[j]) })
 	for len(old) > limit {
-		if gi(old[0], "status", "replicas") == 0 {
+		if specReplicas(old[0]) == 0 && gi(old[0], "status", "replicas") == 0 {
 			_, _, _ = c.st.Delete(kReplicaSets, ns, old[0].GetName())
 		}
 		old = old[1:]
 	}
 
+	// ---- status
 	var total, ready, avail, updated int32
 	for _, r := range rss {
 		n := int32(gi(r, "status", "replicas"))
@@ -342,15 +549,15 @@ func (c *Controller) syncDeployment(du *U) {
 	st.ObservedGeneration = du.GetGeneration()
 	st.Replicas, st.UpdatedReplicas, st.ReadyReplicas, st.AvailableReplicas = total, updated, ready, avail
 	st.UnavailableReplicas = 0
-	if total > avail {
-		st.UnavailableReplicas = total - avail
+	if desired > avail {
+		st.UnavailableReplicas = desired - avail
 	}
-	if avail >= replicas {
+	if avail >= minAvail {
 		setDeployCond(&st.Conditions, appsv1.DeploymentAvailable, corev1.ConditionTrue, "MinimumReplicasAvailable", "Deployment has minimum availability.")
 	} else {
 		setDeployCond(&st.Conditions, appsv1.DeploymentAvailable, corev1.ConditionFalse, "MinimumReplicasUnavailable", "Deployment does not have minimum availability.")
 	}
-	if updated == replicas && total == replicas && avail == replicas {
+	if updated == desired && total == desired && avail == desired {
 		setDeployCond(&st.Conditions, appsv1.DeploymentProgressing, corev1.ConditionTrue, "NewReplicaSetAvailable", fmt.Sprintf("ReplicaSet %q has successfully progressed.", rsName))
 	} else {
 		setDeployCond(&st.Conditions, appsv1.DeploymentProgressing, corev1.ConditionTrue, "ReplicaSetUpdated", fmt.Sprintf("ReplicaSet %q is progressing.", rsName))
@@ -368,72 +575,6 @@ func (c *Controller) syncDeployment(du *U) {
 			return true
 		})
 	}
-}
-
-// ---------------------------------------------------------------- replica sets
-
-// reconcilePods keeps exactly `desired` active pods owned by owner, creating
-// them from tmpl or deleting the newest ones. It returns the number of ready
-// pods (simulated pods are Running as soon as they are created).
-func (c *Controller) reconcilePods(owner *U, tmpl *corev1.PodTemplateSpec, namePrefix string, desired int) int {
-	ns := owner.GetNamespace()
-	pods := activePods(c.ownedBy(kPods, ns, owner.GetUID()))
-	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].GetCreationTimestamp().Time.After(pods[j].GetCreationTimestamp().Time)
-	})
-	for len(pods) > desired { // scale down: newest first
-		_, _, _ = c.st.Delete(kPods, ns, pods[0].GetName())
-		pods = pods[1:]
-	}
-	ready := 0
-	for _, p := range pods {
-		if podPhase(p) == "Running" {
-			ready++
-		}
-	}
-	for i := len(pods); i < desired; i++ {
-		name := namePrefix + "-" + rand.String(5)
-		if err := c.createPod(owner, tmpl, name, "", nil, corev1.PodRunning); err != nil {
-			log.Printf("creating pod %s/%s: %v", ns, name, err)
-			continue
-		}
-		ready++
-	}
-	return ready
-}
-
-func (c *Controller) syncReplicaSet(ru *U) {
-	var rs appsv1.ReplicaSet
-	if err := fromU(ru, &rs); err != nil {
-		return
-	}
-	desired := 1
-	if rs.Spec.Replicas != nil {
-		desired = int(*rs.Spec.Replicas)
-	}
-	ready := c.reconcilePods(ru, &rs.Spec.Template, rs.Name, desired)
-	status := appsv1.ReplicaSetStatus{
-		Replicas: int32(ready), FullyLabeledReplicas: int32(ready), ReadyReplicas: int32(ready),
-		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
-	}
-	c.setStatus(kReplicaSets, ru.GetNamespace(), rs.Name, statusMap(&status))
-}
-
-func (c *Controller) syncReplicationController(ru *U) {
-	var rc corev1.ReplicationController
-	if err := fromU(ru, &rc); err != nil || rc.Spec.Template == nil {
-		return
-	}
-	desired := 1
-	if rc.Spec.Replicas != nil {
-		desired = int(*rc.Spec.Replicas)
-	}
-	ready := c.reconcilePods(ru, rc.Spec.Template, rc.Name, desired)
-	status := corev1.ReplicationControllerStatus{
-		Replicas: int32(ready), FullyLabeledReplicas: int32(ready), ReadyReplicas: int32(ready),
-		AvailableReplicas: int32(ready), ObservedGeneration: ru.GetGeneration(),
-	}
-	c.setStatus(kReplicationControllers, ru.GetNamespace(), rc.Name, statusMap(&status))
 }
 
 // ---------------------------------------------------------------- stateful sets
@@ -460,33 +601,81 @@ func (c *Controller) syncStatefulSet(su *U) {
 		replicas = int(*sts.Spec.Replicas)
 	}
 	rev := sts.Name + "-" + templateHash(&sts.Spec.Template)
-	byName := map[string]*U{}
+	ordered := sts.Spec.PodManagementPolicy != appsv1.ParallelPodManagement
+	const component = "statefulset-controller"
+
+	byOrd := map[int]*U{}
+	outdated := -1
 	for _, p := range activePods(c.ownedBy(kPods, ns, su.GetUID())) {
 		ord := ordinalOf(p.GetName(), sts.Name)
-		if ord < 0 || ord >= replicas || p.GetLabels()["controller-revision-hash"] != rev {
-			_, _, _ = c.st.Delete(kPods, ns, p.GetName()) // scale down or rolling update
+		if ord < 0 || ord >= replicas { // scale down
+			if _, _, err := c.st.Delete(kPods, ns, p.GetName()); err == nil {
+				c.ev.Eventf(su, events.Normal, "SuccessfulDelete", component, "", "delete Pod %s in StatefulSet %s successful", p.GetName(), sts.Name)
+			}
 			continue
 		}
-		byName[p.GetName()] = p
+		byOrd[ord] = p
+		if p.GetLabels()["controller-revision-hash"] != rev && ord > outdated {
+			outdated = ord
+		}
 	}
+	// rolling update: replace the highest outdated pod once everything else is ready
+	if outdated >= 0 {
+		allReady := true
+		for _, p := range byOrd {
+			if !isReady(p) {
+				allReady = false
+			}
+		}
+		if allReady {
+			victim := byOrd[outdated]
+			if _, _, err := c.st.Delete(kPods, ns, victim.GetName()); err == nil {
+				c.ev.Eventf(su, events.Normal, "SuccessfulDelete", component, "", "delete Pod %s in StatefulSet %s successful", victim.GetName(), sts.Name)
+				delete(byOrd, outdated)
+			}
+		}
+	}
+	created := 0
 	for i := 0; i < replicas; i++ {
-		name := fmt.Sprintf("%s-%d", sts.Name, i)
-		if _, ok := byName[name]; ok {
+		if p, ok := byOrd[i]; ok {
+			if ordered && !isReady(p) {
+				break // OrderedReady: wait for this pod before creating the next
+			}
 			continue
 		}
+		name := fmt.Sprintf("%s-%d", sts.Name, i)
 		extra := map[string]string{
 			"controller-revision-hash":           rev,
 			"statefulset.kubernetes.io/pod-name": name,
 			"apps.kubernetes.io/pod-index":       strconv.Itoa(i),
 		}
-		if err := c.createPod(su, &sts.Spec.Template, name, "", extra, corev1.PodRunning); err != nil {
+		if err := c.createPod(su, &sts.Spec.Template, name, "", extra); err != nil {
 			log.Printf("creating pod %s/%s: %v", ns, name, err)
+			break
+		}
+		c.ev.Eventf(su, events.Normal, "SuccessfulCreate", component, "", "create Pod %s in StatefulSet %s successful", name, sts.Name)
+		created++
+		if ordered {
+			break
 		}
 	}
+	var ready, updated int32
+	for _, p := range byOrd {
+		if isReady(p) {
+			ready++
+		}
+		if p.GetLabels()["controller-revision-hash"] == rev {
+			updated++
+		}
+	}
+	current := sts.Status.CurrentRevision
+	if current == "" || (int(updated) == replicas && int(ready) == replicas) {
+		current = rev
+	}
 	status := appsv1.StatefulSetStatus{
-		ObservedGeneration: su.GetGeneration(), Replicas: int32(replicas), ReadyReplicas: int32(replicas),
-		AvailableReplicas: int32(replicas), CurrentReplicas: int32(replicas), UpdatedReplicas: int32(replicas),
-		CurrentRevision: rev, UpdateRevision: rev,
+		ObservedGeneration: su.GetGeneration(), Replicas: int32(len(byOrd) + created), ReadyReplicas: ready,
+		AvailableReplicas: ready, CurrentReplicas: updated, UpdatedReplicas: updated,
+		CurrentRevision: current, UpdateRevision: rev,
 	}
 	c.setStatus(kStatefulSet, ns, sts.Name, statusMap(&status))
 }
@@ -499,40 +688,69 @@ func (c *Controller) syncDaemonSet(du *U) {
 		return
 	}
 	ns := du.GetNamespace()
+	tmplPod := &corev1.Pod{ObjectMeta: *ds.Spec.Template.ObjectMeta.DeepCopy(), Spec: *ds.Spec.Template.Spec.DeepCopy()}
 	nodes, _ := c.st.List(kNodes, "")
-	nodeSet := map[string]bool{}
-	for _, n := range nodes {
-		nodeSet[n.GetName()] = true
+	eligible := map[string]bool{}
+	var names []string
+	for _, nu := range nodes { // nodes that match nodeSelector/affinity and whose taints are tolerated
+		var n corev1.Node
+		if fromU(nu, &n) != nil || nu.GetDeletionTimestamp() != nil {
+			continue
+		}
+		if ok, _ := kubesim.NodeFits(&n, tmplPod); ok {
+			eligible[n.Name] = true
+			names = append(names, n.Name)
+		}
 	}
 	hash := templateHash(&ds.Spec.Template)
 	byNode := map[string]*U{}
 	for _, p := range activePods(c.ownedBy(kPods, ns, du.GetUID())) {
 		node := gs(p, "spec", "nodeName")
-		if !nodeSet[node] || byNode[node] != nil || p.GetLabels()["controller-revision-hash"] != hash {
+		if !eligible[node] || byNode[node] != nil || p.GetLabels()["controller-revision-hash"] != hash {
 			_, _, _ = c.st.Delete(kPods, ns, p.GetName())
 			continue
 		}
 		byNode[node] = p
 	}
-	for _, n := range nodes {
-		if byNode[n.GetName()] != nil {
+	created := 0
+	for _, node := range names {
+		if byNode[node] != nil {
 			continue
 		}
 		extra := map[string]string{"controller-revision-hash": hash, "pod-template-generation": "1"}
 		name := ds.Name + "-" + rand.String(5)
-		if err := c.createPod(du, &ds.Spec.Template, name, n.GetName(), extra, corev1.PodRunning); err != nil {
+		if err := c.createPod(du, &ds.Spec.Template, name, node, extra); err != nil {
 			log.Printf("creating pod %s/%s: %v", ns, name, err)
+			continue
+		}
+		c.ev.Eventf(du, events.Normal, "SuccessfulCreate", "daemonset-controller", "", "Created pod: %s", name)
+		created++
+	}
+	var ready int32
+	for _, p := range byNode {
+		if isReady(p) {
+			ready++
 		}
 	}
-	n := int32(len(nodes))
+	current := int32(len(byNode) + created)
 	status := appsv1.DaemonSetStatus{
-		ObservedGeneration: du.GetGeneration(), DesiredNumberScheduled: n, CurrentNumberScheduled: n,
-		NumberReady: n, UpdatedNumberScheduled: n, NumberAvailable: n,
+		ObservedGeneration: du.GetGeneration(), DesiredNumberScheduled: int32(len(names)), CurrentNumberScheduled: current,
+		NumberReady: ready, UpdatedNumberScheduled: current, NumberAvailable: ready,
+		NumberMisscheduled: 0, NumberUnavailable: int32(len(names)) - ready,
 	}
 	c.setStatus(kDaemonSets, ns, ds.Name, statusMap(&status))
 }
 
 // ---------------------------------------------------------------- jobs
+
+func hasJobCond(conds []batchv1.JobCondition, t batchv1.JobConditionType) bool {
+	for _, cd := range conds {
+		if cd.Type == t && cd.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
 
 func (c *Controller) syncJob(ju *U) {
 	var job batchv1.Job
@@ -540,50 +758,77 @@ func (c *Controller) syncJob(ju *U) {
 		return
 	}
 	ns := ju.GetNamespace()
-	completions := int32(1)
+	completions, parallelism, backoffLimit := int32(1), int32(1), int32(6)
 	if job.Spec.Completions != nil {
 		completions = *job.Spec.Completions
 	}
-	pods := activePods(c.ownedBy(kPods, ns, ju.GetUID()))
-	extra := map[string]string{
-		"batch.kubernetes.io/job-name": job.Name, "job-name": job.Name,
-		"batch.kubernetes.io/controller-uid": string(ju.GetUID()), "controller-uid": string(ju.GetUID()),
+	if job.Spec.Parallelism != nil {
+		parallelism = *job.Spec.Parallelism
 	}
-	// Pods "run" instantly and always succeed.
-	succeeded := int32(len(pods))
-	for i := len(pods); i < int(completions); i++ {
-		name := job.Name + "-" + rand.String(5)
-		if err := c.createPod(ju, &job.Spec.Template, name, "", extra, corev1.PodSucceeded); err != nil {
-			log.Printf("creating pod %s/%s: %v", ns, name, err)
-			continue
+	if job.Spec.BackoffLimit != nil {
+		backoffLimit = *job.Spec.BackoffLimit
+	}
+	var succeeded, failed, active, ready int32
+	var running []*U
+	for _, p := range c.ownedBy(kPods, ns, ju.GetUID()) {
+		switch podPhase(p) {
+		case "Succeeded":
+			succeeded++
+		case "Failed":
+			failed++
+		default:
+			if p.GetDeletionTimestamp() == nil {
+				active++
+				running = append(running, p)
+				if isReady(p) {
+					ready++
+				}
+			}
 		}
-		succeeded++
-	}
-	if succeeded > completions {
-		succeeded = completions
 	}
 	status := job.Status.DeepCopy()
 	now := metav1.Now()
 	if status.StartTime == nil {
 		status.StartTime = &now
 	}
-	status.Succeeded, status.Active, status.Ready, status.Terminating = succeeded, 0, ptr.To(int32(0)), ptr.To(int32(0))
-	if succeeded >= completions {
-		if status.CompletionTime == nil {
-			status.CompletionTime = &now
-		}
-		found := false
-		for _, cd := range status.Conditions {
-			if cd.Type == batchv1.JobComplete {
-				found = true
+	finished := hasJobCond(status.Conditions, batchv1.JobComplete) || hasJobCond(status.Conditions, batchv1.JobFailed)
+	if !finished {
+		switch {
+		case failed > backoffLimit:
+			for _, p := range running {
+				_, _, _ = c.st.Delete(kPods, ns, p.GetName())
 			}
-		}
-		if !found {
+			active, ready = 0, 0
+			status.Conditions = append(status.Conditions, batchv1.JobCondition{
+				Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded",
+				Message: "Job has reached the specified backoff limit", LastProbeTime: now, LastTransitionTime: now,
+			})
+			c.ev.Eventf(ju, events.Warning, "BackoffLimitExceeded", "job-controller", "", "Job has reached the specified backoff limit")
+		case succeeded >= completions:
+			status.CompletionTime = &now
 			status.Conditions = append(status.Conditions, batchv1.JobCondition{
 				Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastProbeTime: now, LastTransitionTime: now,
 			})
+			c.ev.Eventf(ju, events.Normal, "Completed", "job-controller", "", "Job completed")
+		default:
+			extra := map[string]string{
+				"batch.kubernetes.io/job-name": job.Name, "job-name": job.Name,
+				"batch.kubernetes.io/controller-uid": string(ju.GetUID()), "controller-uid": string(ju.GetUID()),
+			}
+			n := min(completions-succeeded-active, parallelism-active)
+			for i := int32(0); i < n; i++ {
+				name := job.Name + "-" + rand.String(5)
+				if err := c.createPod(ju, &job.Spec.Template, name, "", extra); err != nil {
+					log.Printf("creating pod %s/%s: %v", ns, name, err)
+					break
+				}
+				c.ev.Eventf(ju, events.Normal, "SuccessfulCreate", "job-controller", "", "Created pod: %s", name)
+				active++
+			}
 		}
 	}
+	status.Succeeded, status.Failed, status.Active = succeeded, failed, active
+	status.Ready, status.Terminating = ptr.To(ready), ptr.To(int32(0))
 	c.setStatus(kJobs, ns, job.Name, statusMap(status))
 }
 
@@ -619,31 +864,36 @@ func (c *Controller) syncEndpoints() {
 		}
 		sel := labels.SelectorFromSet(svc.Spec.Selector)
 		pods, _ := c.st.List(kPods, su.GetNamespace())
-		var addrs []corev1.EndpointAddress
+		var ready, notReady []corev1.EndpointAddress
 		var first *corev1.Pod
 		for _, pu := range pods {
-			if pu.GetDeletionTimestamp() != nil || podPhase(pu) != "Running" || !sel.Matches(labels.Set(pu.GetLabels())) {
+			if pu.GetDeletionTimestamp() != nil || !sel.Matches(labels.Set(pu.GetLabels())) {
 				continue
 			}
 			var p corev1.Pod
-			if fromU(pu, &p) != nil || p.Status.PodIP == "" {
+			if fromU(pu, &p) != nil || p.Status.PodIP == "" || terminalPhase(p.Status.Phase) {
 				continue
 			}
-			if first == nil {
-				first = &p
-			}
-			addrs = append(addrs, corev1.EndpointAddress{
+			addr := corev1.EndpointAddress{
 				IP: p.Status.PodIP, NodeName: ptr.To(p.Spec.NodeName),
 				TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: p.Namespace, Name: p.Name, UID: p.UID},
-			})
+			}
+			if isReady(pu) {
+				if first == nil {
+					first = &p
+				}
+				ready = append(ready, addr)
+			} else {
+				notReady = append(notReady, addr)
+			}
 		}
 		var subsets []corev1.EndpointSubset
-		if len(addrs) > 0 {
+		if len(ready) > 0 || len(notReady) > 0 {
 			var ports []corev1.EndpointPort
 			for _, sp := range svc.Spec.Ports {
 				ports = append(ports, corev1.EndpointPort{Name: sp.Name, Port: resolveTargetPort(sp, first), Protocol: sp.Protocol})
 			}
-			subsets = []corev1.EndpointSubset{{Addresses: addrs, Ports: ports}}
+			subsets = []corev1.EndpointSubset{{Addresses: ready, NotReadyAddresses: notReady, Ports: ports}}
 		}
 		c.upsertEndpoints(&svc, subsets)
 	}
@@ -653,6 +903,10 @@ func (c *Controller) syncEndpoints() {
 			_, _, _ = c.st.Delete(kEndpoints, ep.GetNamespace(), ep.GetName())
 		}
 	}
+}
+
+func terminalPhase(p corev1.PodPhase) bool {
+	return p == corev1.PodSucceeded || p == corev1.PodFailed
 }
 
 func (c *Controller) upsertEndpoints(svc *corev1.Service, subsets []corev1.EndpointSubset) {
@@ -689,8 +943,8 @@ func (c *Controller) upsertEndpoints(svc *corev1.Service, subsets []corev1.Endpo
 
 // ---------------------------------------------------------------- garbage collection
 
-// gc removes objects whose namespace is gone and dependents whose owners are
-// all gone (the cascading delete a real cluster performs).
+// gc removes objects whose namespace is gone, dependents whose owners are all
+// gone (the cascading delete a real cluster performs) and events older than an hour.
 func (c *Controller) gc() {
 	all := c.st.Snapshot()
 	uids := map[types.UID]bool{}
@@ -705,6 +959,12 @@ func (c *Controller) gc() {
 		o := sn.Obj
 		if ns := o.GetNamespace(); ns != "" && !namespaces[ns] {
 			_, _, _ = c.st.Delete(sn.Key, ns, o.GetName())
+			continue
+		}
+		if sn.Key == kEvents {
+			if ts, err := time.Parse(time.RFC3339, gs(o, "lastTimestamp")); err == nil && time.Since(ts) > time.Hour {
+				_, _, _ = c.st.Delete(sn.Key, o.GetNamespace(), o.GetName())
+			}
 			continue
 		}
 		refs := o.GetOwnerReferences()

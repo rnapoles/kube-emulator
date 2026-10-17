@@ -12,8 +12,6 @@ type (
 )
 
 const (
-	emulatorNode       = objects.EmulatorNode
-	emulatorNodeIP     = objects.EmulatorNodeIP
 	revisionAnnotation = "deployment.kubernetes.io/revision"
 	managedLabel       = "emulator.kube/managed"
 )
@@ -33,6 +31,7 @@ var (
 	kPods        = registry.KPods
 	kServices    = registry.KServices
 	kEndpoints   = registry.KEndpoints
+	kEvents      = registry.KEvents
 	kSAs         = registry.KSAs
 	kDeployments = registry.KDeployments
 	kReplicaSets = registry.KReplicaSets

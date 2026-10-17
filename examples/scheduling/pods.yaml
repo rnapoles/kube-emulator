@@ -1,0 +1,98 @@
+# Try:  kubectl apply -f examples/scheduling/pods.yaml && kubectl get pods -o wide
+# then:  kubectl describe pod ssd-without-toleration   (FailedScheduling event)
+---
+# lands on gpu-node: matches the nodeSelector, tolerates the taint, fits the GPU request
+apiVersion: v1
+kind: Pod
+metadata:
+  name: needs-gpu
+spec:
+  nodeSelector:
+    accelerator: nvidia
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+  containers:
+    - name: app
+      image: busybox
+      resources:
+        requests:
+          nvidia.com/gpu: "1"
+---
+# stays Pending: the only node with disktype=ssd has a taint this pod does not tolerate
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ssd-without-toleration
+spec:
+  nodeSelector:
+    disktype: ssd
+  containers:
+    - name: app
+      image: busybox
+---
+# stays Pending: "Insufficient cpu" on every node
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-big
+spec:
+  containers:
+    - name: app
+      image: busybox
+      resources:
+        requests:
+          cpu: "64"
+---
+# required node affinity (any of two zones) plus a preference for zone-b
+apiVersion: v1
+kind: Pod
+metadata:
+  name: zone-affinity
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: [zone-b, zone-c]
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 10
+          preference:
+            matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: [zone-b]
+  containers:
+    - name: app
+      image: busybox
+---
+# one replica per node (required pod anti-affinity on the hostname)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spread
+  template:
+    metadata:
+      labels:
+        app: spread
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: spread
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: app
+          image: nginx

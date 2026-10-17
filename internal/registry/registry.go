@@ -38,6 +38,7 @@ var (
 	KPods         = rk("", "pods")
 	KServices     = rk("", "services")
 	KEndpoints    = rk("", "endpoints")
+	KEvents       = rk("", "events")
 	KSAs          = rk("", "serviceaccounts")
 	KPVCs         = rk("", "persistentvolumeclaims")
 	KDeployments  = rk("apps", "deployments")
@@ -156,6 +157,18 @@ func (g *Registry) Lookup(group, version, name string) *Resource {
 	return nil
 }
 
+// LookupKind finds a served resource by its kind.
+func (g *Registry) LookupKind(gvk schema.GroupVersionKind) *Resource {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for _, r := range g.res {
+		if r.Group == gvk.Group && r.Version == gvk.Version && r.Kind == gvk.Kind {
+			return r
+		}
+	}
+	return nil
+}
+
 func (g *Registry) ForGV(group, version string) []*Resource {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -242,9 +255,10 @@ func (g *Registry) ResourceList(group, version string) *metav1.APIResourceList {
 			})
 		}
 		if r.Name == "pods" {
-			list.APIResources = append(list.APIResources, metav1.APIResource{
-				Name: "pods/log", Namespaced: true, Kind: "Pod", Verbs: metav1.Verbs{"get"},
-			})
+			list.APIResources = append(list.APIResources,
+				metav1.APIResource{Name: "pods/log", Namespaced: true, Kind: "Pod", Verbs: metav1.Verbs{"get"}},
+				metav1.APIResource{Name: "pods/eviction", Namespaced: true, Group: "policy", Version: "v1", Kind: "Eviction", Verbs: metav1.Verbs{"create"}},
+			)
 		}
 	}
 	return list

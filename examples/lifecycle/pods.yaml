@@ -1,0 +1,93 @@
+# Try:  kubectl apply -f examples/lifecycle/pods.yaml && kubectl get pods -w
+# then: kubectl get events --sort-by=.lastTimestamp   /   kubectl describe pod crashy
+---
+# Pending -> ContainerCreating -> Running, then Ready after a slow readiness probe
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-start
+  annotations:
+    emulator.kube/delay-pull: 4s
+    emulator.kube/delay-ready: 8s
+spec:
+  containers:
+    - name: app
+      image: nginx
+---
+# ErrImagePull -> ImagePullBackOff, over and over
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-image
+  annotations:
+    emulator.kube/fail-image-pull: "true"
+spec:
+  containers:
+    - name: app
+      image: registry.example.com/does-not-exist:1.0
+---
+# runs for 2s, exits with code 3, restarts with growing back-off: CrashLoopBackOff
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashy
+  annotations:
+    emulator.kube/crash: "true"
+    emulator.kube/crash-after: 2s
+    emulator.kube/crash-exit-code: "3"
+    emulator.kube/delay-backoff: 5s
+spec:
+  containers:
+    - name: app
+      image: busybox
+---
+# Running (1/1 started) but never Ready: readiness probe failures show up as events
+apiVersion: v1
+kind: Pod
+metadata:
+  name: never-ready
+  annotations:
+    emulator.kube/fail-readiness: "true"
+spec:
+  containers:
+    - name: app
+      image: nginx
+---
+# a Job: 3 completions, 2 at a time; every pod runs for 5s and then completes
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: batch
+spec:
+  completions: 3
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        emulator.kube/delay-job: 5s
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox
+---
+# a Deployment to roll out. Make the next rollout stall (new pods ErrImagePull, old pods keep serving):
+#   kubectl patch deployment web -p '{"spec":{"template":{"metadata":{"annotations":{"emulator.kube/fail-image-pull":"true"}}}}}'
+#   kubectl rollout status deployment/web --timeout=20s
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25

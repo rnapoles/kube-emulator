@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -305,6 +306,8 @@ func subAllowed(res *Resource, method, sub string) bool {
 		return res.HasScale
 	case "log":
 		return res.Name == "pods" && method == http.MethodGet
+	case "eviction":
+		return res.Name == "pods" && method == http.MethodPost
 	}
 	return false
 }
@@ -336,6 +339,10 @@ func (s *Server) handle(c *reqCtx) {
 			s.get(c)
 		}
 	case http.MethodPost:
+		if c.sub == "eviction" && c.name != "" {
+			s.evict(c)
+			return
+		}
 		if c.name != "" || c.sub != "" {
 			writeError(c.w, apierrors.NewMethodNotSupported(c.res.Key().GR(), "post"))
 			return
@@ -868,7 +875,68 @@ func (s *Server) serverSideApply(c *reqCtx, body []byte) {
 	writeJSON(c.w, http.StatusOK, updated)
 }
 
+// gracePeriod reads gracePeriodSeconds from the query or the DeleteOptions body.
+func gracePeriod(c *reqCtx) *int64 {
+	var grace *int64
+	if v := c.q.Get("gracePeriodSeconds"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			grace = &n
+		}
+	}
+	if body, err := readBody(c); err == nil && len(bytes.TrimSpace(body)) > 0 {
+		var opts metav1.DeleteOptions
+		if json.Unmarshal(body, &opts) == nil && opts.GracePeriodSeconds != nil {
+			grace = opts.GracePeriodSeconds
+		}
+	}
+	return grace
+}
+
+// forceDeletePod removes a pod at once (kubectl delete --force --grace-period=0).
+func (s *Server) forceDeletePod(ns, name string) (*U, error) {
+	return s.store.Mutate(kPods, ns, name, func(cur *U) (*U, error) {
+		var rest []string
+		for _, f := range cur.GetFinalizers() {
+			if f != objects.KubeletFinalizer {
+				rest = append(rest, f)
+			}
+		}
+		if cur.GetDeletionTimestamp() == nil {
+			now := metav1.Now()
+			cur.SetDeletionTimestamp(&now)
+		}
+		cur.SetFinalizers(rest)
+		return cur, nil
+	}, false)
+}
+
+// evict implements pods/eviction (used by kubectl drain). Pod disruption
+// budgets are not consulted.
+func (s *Server) evict(c *reqCtx) {
+	obj, _, err := s.store.Delete(kPods, c.ns, c.name)
+	if err != nil {
+		writeError(c.w, err)
+		return
+	}
+	writeJSON(c.w, http.StatusCreated, successStatus(c.res, obj))
+}
+
 func (s *Server) delete(c *reqCtx) {
+	grace := gracePeriod(c)
+	if c.res.Key() == kPods && grace != nil && *grace == 0 && !dryRun(c.q) {
+		obj, err := s.forceDeletePod(c.ns, c.name)
+		if err != nil {
+			writeError(c.w, err)
+			return
+		}
+		if len(obj.GetFinalizers()) > 0 { // someone else's finalizer keeps it around
+			obj.SetAPIVersion(c.res.APIVersion())
+			writeJSON(c.w, http.StatusOK, obj)
+			return
+		}
+		writeJSON(c.w, http.StatusOK, successStatus(c.res, obj))
+		return
+	}
 	if dryRun(c.q) {
 		obj, err := s.store.Get(c.res.Key(), c.ns, c.name)
 		if err != nil {

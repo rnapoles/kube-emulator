@@ -24,6 +24,8 @@ import (
 
 	"github.com/rnapoles/kube-emulator/internal/config"
 	"github.com/rnapoles/kube-emulator/internal/controllers"
+	"github.com/rnapoles/kube-emulator/internal/events"
+	"github.com/rnapoles/kube-emulator/internal/kubesim"
 	"github.com/rnapoles/kube-emulator/internal/objects"
 	"github.com/rnapoles/kube-emulator/internal/openapi"
 	"github.com/rnapoles/kube-emulator/internal/server"
@@ -40,6 +42,12 @@ var flagEnvKeys = map[string]string{
 	"kinds-dir":        "KUBE_EMULATOR_KINDS_DIR",
 	"kinds-reload":     "KUBE_EMULATOR_KINDS_RELOAD",
 	"openapi-spec":     "KUBE_EMULATOR_OPENAPI_SPEC",
+	"nodes":            "KUBE_EMULATOR_NODES",
+	"node-cpu":         "KUBE_EMULATOR_NODE_CPU",
+	"node-memory":      "KUBE_EMULATOR_NODE_MEMORY",
+	"node-pods":        "KUBE_EMULATOR_NODE_PODS",
+	"delays":           "KUBE_EMULATOR_DELAYS",
+	"seed-dir":         "KUBE_EMULATOR_SEED_DIR",
 	"v":                "KUBE_EMULATOR_VERBOSE",
 }
 
@@ -54,6 +62,12 @@ func main() {
 		kindsDir = flag.String("kinds-dir", "", "folder with CustomResourceDefinition files (YAML/JSON); the kinds they define are served without code changes")
 		kindsInt = flag.Duration("kinds-reload", 2*time.Second, "how often --kinds-dir is re-scanned for changes (0 = load once at start-up)")
 		specPath = flag.String("openapi-spec", "", "swagger.json (OpenAPI v2) whose definitions are served so that `kubectl explain` works for built-in kinds")
+		nodes    = flag.Int("nodes", 1, "number of fake nodes to create (emulator-node-1..N, spread over three zones)")
+		nodeCPU  = flag.String("node-cpu", "8", "CPU capacity of generated nodes and of nodes created without capacity")
+		nodeMem  = flag.String("node-memory", "16Gi", "memory capacity of generated nodes and of nodes created without capacity")
+		nodePods = flag.Int("node-pods", 110, "maximum number of pods per node")
+		delays   = flag.String("delays", "", `pod lifecycle delays, for example "pull=3s,ready=5s" (names: schedule, pull, start, ready, job, terminate, backoff) or "instant"`)
+		seedDir  = flag.String("seed-dir", "", "folder with manifests (nodes, namespaces, workloads, ...) created at start-up if they do not exist yet")
 		envFile  = flag.String("env-file", ".env", "file with default settings (KUBE_EMULATOR_*=value); command line flags take precedence")
 		showHelp = flag.Bool("h", false, "show help")
 	)
@@ -111,13 +125,28 @@ func main() {
 		srv.SetOpenAPI(spec)
 		log.Printf("openapi: loaded %d definitions from %s", spec.NumDefinitions(), *specPath)
 	}
-	if err := controllers.Bootstrap(st, ipam, *port); err != nil {
+	if err := controllers.Bootstrap(st, *port); err != nil {
 		log.Fatalf("bootstrapping cluster objects: %v", err)
 	}
 
+	nodeOpts := kubesim.NodeOptions{Count: *nodes, CPU: *nodeCPU, Memory: *nodeMem, Pods: *nodePods}
+	if err := nodeOpts.Validate(); err != nil {
+		log.Fatal(err)
+	}
+	if err := kubesim.EnsureNodes(st, nodeOpts); err != nil {
+		log.Fatalf("creating nodes: %v", err)
+	}
+	lifecycle, err := kubesim.ParseDelays(*delays, kubesim.DefaultDelays())
+	if err != nil {
+		log.Fatalf("--delays: %v", err)
+	}
+	rec := events.NewRecorder(st)
+	sim := kubesim.New(st, rec, ipam, lifecycle, nodeOpts)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go controllers.New(st, ipam).Run(ctx)
+	go sim.Run(ctx)
+	go controllers.New(st, rec).Run(ctx)
 
 	if *kindsDir != "" {
 		loader := srv.NewKindsLoader(*kindsDir)
@@ -128,6 +157,11 @@ func main() {
 			go loader.Watch(ctx, *kindsInt)
 		}
 		log.Printf("kinds: loading CustomResourceDefinitions from %s", *kindsDir)
+	}
+	if *seedDir != "" {
+		if err := srv.SeedDir(*seedDir); err != nil {
+			log.Fatalf("seeding from %s: %v", *seedDir, err)
+		}
 	}
 
 	host := *bind
@@ -150,6 +184,7 @@ func main() {
 		}
 	}()
 
+	log.Printf("cluster: %d fake node(s), pod lifecycle delays %+v", *nodes, lifecycle)
 	if *storage == "sqlite" {
 		log.Printf("storage: SQLite (%s)", *dbPath)
 	} else {

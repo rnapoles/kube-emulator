@@ -31,6 +31,7 @@ var (
 	kPods        = registry.KPods
 	kServices    = registry.KServices
 	kEndpoints   = registry.KEndpoints
+	kEvents      = registry.KEvents
 	kSAs         = registry.KSAs
 	kPVCs        = registry.KPVCs
 	kDeployments = registry.KDeployments

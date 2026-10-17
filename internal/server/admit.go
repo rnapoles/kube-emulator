@@ -141,7 +141,7 @@ func (s *Server) admitCreate(res *Resource, ns string, in k8sruntime.Object) (*U
 	if err := s.validateCR(res, u); err != nil {
 		return nil, err
 	}
-	if res.HasStatus {
+	if res.HasStatus && res.Key() != kNodes { // nodes register themselves with their status
 		delete(u.Object, "status")
 	}
 	initMeta(u)
@@ -198,7 +198,7 @@ func (s *Server) admitUpdate(res *Resource, ns, name, sub string, in k8sruntime.
 	u.SetResourceVersion(cur.GetResourceVersion())
 	u.SetGeneration(cur.GetGeneration())
 	u.SetManagedFields(nil)
-	if res.HasStatus {
+	if res.HasStatus && res.Key() != kNodes {
 		if st, ok := cur.Object["status"]; ok {
 			u.Object["status"] = st
 		} else {
@@ -297,7 +297,7 @@ func reconcileImmutable(res *Resource, cur, u *U) field.ErrorList {
 func (s *Server) afterCreate(res *Resource, u *U) error {
 	switch res.Key() {
 	case kPods:
-		return objects.SimulatePod(s.ipam, u, corev1.PodRunning)
+		return objects.PreparePod(u)
 	case kServices:
 		return s.allocateService(u)
 	case kNamespaces:

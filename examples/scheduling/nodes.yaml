@@ -1,0 +1,40 @@
+# Extra nodes with labels, taints and capacity.
+# Start the emulator with:  ./kube-emulator --nodes=2 --seed-dir=./examples/scheduling
+# (or create them later with: kubectl apply -f examples/scheduling/nodes.yaml)
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node
+  labels:
+    disktype: ssd
+    accelerator: nvidia
+    topology.kubernetes.io/zone: zone-a
+spec:
+  taints:
+    - key: dedicated
+      value: gpu
+      effect: NoSchedule
+status:
+  capacity:
+    cpu: "16"
+    memory: 64Gi
+    pods: "50"
+    nvidia.com/gpu: "4"
+  allocatable:
+    cpu: "16"
+    memory: 64Gi
+    pods: "50"
+    nvidia.com/gpu: "4"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: small-node
+  labels:
+    disktype: hdd
+    topology.kubernetes.io/zone: zone-b
+status:
+  capacity:
+    cpu: "2"
+    memory: 4Gi
+    pods: "10"

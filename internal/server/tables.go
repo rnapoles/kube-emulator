@@ -18,6 +18,7 @@ type colDef struct{ Name, Type, Format, Description string }
 type tableDef struct {
 	cols []colDef
 	row  func(u *U) []interface{}
+	wide map[string]bool // columns only shown with -o wide (priority 1)
 }
 
 var (
@@ -51,8 +52,12 @@ func (s *Server) table(res *Resource, items []*U, rv string) *metav1.Table {
 		ListMeta: metav1.ListMeta{ResourceVersion: rv},
 	}
 	for _, c := range def.cols {
+		var prio int32
+		if def.wide[c.Name] {
+			prio = 1
+		}
 		t.ColumnDefinitions = append(t.ColumnDefinitions, metav1.TableColumnDefinition{
-			Name: c.Name, Type: c.Type, Format: c.Format, Description: c.Description,
+			Name: c.Name, Type: c.Type, Format: c.Format, Description: c.Description, Priority: prio,
 		})
 	}
 	for _, it := range items {
@@ -78,26 +83,50 @@ func tableDefFor(res *Resource) tableDef {
 				{"Ready", "string", "", "The aggregate readiness state of this pod for accepting traffic."},
 				{"Status", "string", "", "The aggregate status of the containers in this pod."},
 				{"Restarts", "string", "", "The number of times the containers in this pod have been restarted."},
-				cAge},
+				cAge,
+				{"IP", "string", "", "IP address allocated to the pod."},
+				{"Node", "string", "", "The node the pod is bound to."},
+				{"Nominated Node", "string", "", "The nominated node."},
+				{"Readiness Gates", "string", "", "The readiness gates."}},
+			wide: map[string]bool{"IP": true, "Node": true, "Nominated Node": true, "Readiness Gates": true},
 			row: func(u *U) []interface{} {
 				cons, _, _ := unstructured.NestedSlice(u.Object, "spec", "containers")
 				css, _, _ := unstructured.NestedSlice(u.Object, "status", "containerStatuses")
 				ready, restarts := 0, int64(0)
+				status := gs(u, "status", "phase")
+				if r := gs(u, "status", "reason"); r != "" {
+					status = r
+				}
 				for _, c := range css {
-					if m, ok := c.(map[string]interface{}); ok {
-						if b, _ := m["ready"].(bool); b {
-							ready++
+					m, _ := c.(map[string]interface{})
+					if b, _ := m["ready"].(bool); b {
+						ready++
+					}
+					if n, ok := m["restartCount"].(int64); ok {
+						restarts += n
+					}
+					state, _ := m["state"].(map[string]interface{})
+					if w, ok := state["waiting"].(map[string]interface{}); ok {
+						if r, _ := w["reason"].(string); r != "" {
+							status = r
 						}
-						if n, ok := m["restartCount"].(int64); ok {
-							restarts += n
+					} else if t, ok := state["terminated"].(map[string]interface{}); ok {
+						if r, _ := t["reason"].(string); r != "" {
+							status = r
 						}
 					}
 				}
-				status := gs(u, "status", "phase")
 				if u.GetDeletionTimestamp() != nil {
 					status = "Terminating"
 				}
-				return []interface{}{u.GetName(), fmt.Sprintf("%d/%d", ready, len(cons)), status, fmt.Sprint(restarts), humanAge(u)}
+				node, ip := gs(u, "spec", "nodeName"), gs(u, "status", "podIP")
+				if node == "" {
+					node = "<none>"
+				}
+				if ip == "" {
+					ip = "<none>"
+				}
+				return []interface{}{u.GetName(), fmt.Sprintf("%d/%d", ready, len(cons)), status, fmt.Sprint(restarts), humanAge(u), ip, node, "<none>", "<none>"}
 			},
 		}
 	case kDeployments:
@@ -189,7 +218,10 @@ func tableDefFor(res *Resource) tableDef {
 		}
 	case kNodes:
 		return tableDef{
-			cols: []colDef{cName, {"Status", "string", "", ""}, {"Roles", "string", "", ""}, cAge, {"Version", "string", "", ""}},
+			cols: []colDef{cName, {"Status", "string", "", ""}, {"Roles", "string", "", ""}, cAge, {"Version", "string", "", ""},
+				{"Internal-IP", "string", "", ""}, {"External-IP", "string", "", ""}, {"OS-Image", "string", "", ""},
+				{"Kernel-Version", "string", "", ""}, {"Container-Runtime", "string", "", ""}},
+			wide: map[string]bool{"Internal-IP": true, "External-IP": true, "OS-Image": true, "Kernel-Version": true, "Container-Runtime": true},
 			row: func(u *U) []interface{} {
 				var roles []string
 				for k := range u.GetLabels() {
@@ -202,7 +234,46 @@ func tableDefFor(res *Resource) tableDef {
 				if r == "" {
 					r = "<none>"
 				}
-				return []interface{}{u.GetName(), "Ready", r, humanAge(u), gs(u, "status", "nodeInfo", "kubeletVersion")}
+				status := "NotReady"
+				conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+				for _, cd := range conds {
+					if m, ok := cd.(map[string]interface{}); ok && m["type"] == "Ready" && m["status"] == "True" {
+						status = "Ready"
+					}
+				}
+				if off, _, _ := unstructured.NestedBool(u.Object, "spec", "unschedulable"); off {
+					status += ",SchedulingDisabled"
+				}
+				ip := "<none>"
+				addrs, _, _ := unstructured.NestedSlice(u.Object, "status", "addresses")
+				for _, a := range addrs {
+					if m, ok := a.(map[string]interface{}); ok && m["type"] == "InternalIP" {
+						ip, _ = m["address"].(string)
+					}
+				}
+				return []interface{}{u.GetName(), status, r, humanAge(u), gs(u, "status", "nodeInfo", "kubeletVersion"),
+					ip, "<none>", gs(u, "status", "nodeInfo", "osImage"), gs(u, "status", "nodeInfo", "kernelVersion"),
+					gs(u, "status", "nodeInfo", "containerRuntimeVersion")}
+			},
+		}
+	case kEvents:
+		ago := func(ts string) string {
+			t, err := time.Parse(time.RFC3339, ts)
+			if err != nil {
+				return "<unknown>"
+			}
+			return duration.HumanDuration(time.Since(t))
+		}
+		return tableDef{
+			cols: []colDef{{"Last Seen", "string", "", ""}, {"Type", "string", "", ""}, {"Reason", "string", "", ""},
+				{"Object", "string", "", ""}, {"Subobject", "string", "", ""}, {"Source", "string", "", ""},
+				{"Message", "string", "", ""}, {"First Seen", "string", "", ""}, {"Count", "integer", "", ""}, {"Name", "string", "", ""}},
+			wide: map[string]bool{"Subobject": true, "Source": true, "First Seen": true, "Count": true, "Name": true},
+			row: func(u *U) []interface{} {
+				obj := strings.ToLower(gs(u, "involvedObject", "kind")) + "/" + gs(u, "involvedObject", "name")
+				return []interface{}{ago(gs(u, "lastTimestamp")), gs(u, "type"), gs(u, "reason"), obj,
+					gs(u, "involvedObject", "fieldPath"), gs(u, "source", "component"), gs(u, "message"),
+					ago(gs(u, "firstTimestamp")), gi(u, "count"), u.GetName()}
 			},
 		}
 	case ResourceKey{"", "configmaps"}:
