@@ -30,6 +30,8 @@ import (
 	"github.com/rnapoles/kube-emulator/internal/openapi"
 	"github.com/rnapoles/kube-emulator/internal/server"
 	"github.com/rnapoles/kube-emulator/internal/store"
+	"github.com/rnapoles/kube-emulator/internal/trace"
+	"github.com/rnapoles/kube-emulator/internal/tui"
 )
 
 // flagEnvKeys maps each flag to the environment variable / .env key that sets it.
@@ -48,6 +50,7 @@ var flagEnvKeys = map[string]string{
 	"node-pods":        "KUBE_EMULATOR_NODE_PODS",
 	"delays":           "KUBE_EMULATOR_DELAYS",
 	"seed-dir":         "KUBE_EMULATOR_SEED_DIR",
+	"tui":              "KUBE_EMULATOR_TUI",
 	"v":                "KUBE_EMULATOR_VERBOSE",
 }
 
@@ -68,6 +71,7 @@ func main() {
 		nodePods = flag.Int("node-pods", 110, "maximum number of pods per node")
 		delays   = flag.String("delays", "", `pod lifecycle delays, for example "pull=3s,ready=5s" (names: schedule, pull, start, ready, job, terminate, backoff) or "instant"`)
 		seedDir  = flag.String("seed-dir", "", "folder with manifests (nodes, namespaces, workloads, ...) created at start-up if they do not exist yet")
+		tuiFlag  = flag.Bool("tui", false, "show a terminal UI: live list of requests and responses with filters and a JSON inspector")
 		envFile  = flag.String("env-file", ".env", "file with default settings (KUBE_EMULATOR_*=value); command line flags take precedence")
 		showHelp = flag.Bool("h", false, "show help")
 	)
@@ -140,13 +144,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("--delays: %v", err)
 	}
-	rec := events.NewRecorder(st)
-	sim := kubesim.New(st, rec, ipam, lifecycle, nodeOpts)
+	evrec := events.NewRecorder(st)
+	sim := kubesim.New(st, evrec, ipam, lifecycle, nodeOpts)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sim.Run(ctx)
-	go controllers.New(st, rec).Run(ctx)
+	go controllers.New(st, evrec).Run(ctx)
 
 	if *kindsDir != "" {
 		loader := srv.NewKindsLoader(*kindsDir)
@@ -175,7 +179,9 @@ func main() {
 	}
 
 	httpSrv := &http.Server{Addr: addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -184,6 +190,22 @@ func main() {
 		}
 	}()
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("listening on %s: %v", addr, err)
+	}
+
+	// With --tui the terminal belongs to the UI: requests are recorded for it
+	// and log output is collected instead of printed.
+	var rec *trace.Recorder
+	var logs *tui.LogBuffer
+	if *tuiFlag {
+		rec = trace.NewRecorder(2000, 256<<10)
+		httpSrv.Handler = rec.Middleware(srv)
+		logs = tui.NewLogBuffer(1000)
+		log.SetOutput(logs)
+	}
+
 	log.Printf("cluster: %d fake node(s), pod lifecycle delays %+v", *nodes, lifecycle)
 	if *storage == "sqlite" {
 		log.Printf("storage: SQLite (%s)", *dbPath)
@@ -191,15 +213,33 @@ func main() {
 		log.Printf("storage: memory (state is lost on exit)")
 	}
 	log.Printf("emulated Kubernetes API listening on %s", serverURL)
+
+	if *tuiFlag {
+		go func() {
+			if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("server: %v", err)
+				stop()
+			}
+		}()
+		if err := tui.Run(ctx, tui.Options{Rec: rec, Logs: logs, URL: serverURL}); err != nil {
+			log.SetOutput(os.Stderr)
+			log.Printf("terminal UI: %v", err)
+		}
+		stop() // quitting the UI stops the emulator
+		<-shutdownDone
+		return
+	}
+
 	fmt.Printf("\ntry:  kubectl --server=%s get namespaces\n", serverURL)
 	if *kubecfg != "" {
 		fmt.Printf("or:   KUBECONFIG=%s kubectl get nodes\n", *kubecfg)
 	}
 	fmt.Println()
 
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	<-shutdownDone
 }
 
 func displayHost(bind string) string {

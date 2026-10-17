@@ -1,4 +1,4 @@
-# kube-emulator
+# kube-emulator + Live Kubernetes API request/response inspection
 
 A fake Kubernetes API server written in Go. It speaks the Kubernetes REST API,
 so `kubectl` (and client libraries) work against it, but it **never starts a
@@ -6,6 +6,8 @@ container**: objects live in memory or in an SQLite database, and a few
 simulated controllers fill in the status a real cluster would report.
 
 Default address: `http://127.0.0.1:8085`.
+
+![Screenshot of kube-emulator](screenshot/kube-emulator.png)
 
 ## Build and run
 
@@ -17,6 +19,20 @@ go build -o kube-emulator ./cmd/kube-emulator
 ./kube-emulator --storage=sqlite                  # persisted in ./kube-emulator.db
 ./kube-emulator --storage=sqlite --sqlite-path=/tmp/k8s.db --port=9000
 ./kube-emulator --write-kubeconfig=./emulator.kubeconfig
+```
+
+### kubectl
+
+```bash
+KUBECONFIG=./emulator.kubeconfig
+./kube-emulator --nodes=3 --seed-dir=./examples/scheduling
+kubectl get nodes -o wide
+kubectl apply -f examples/scheduling/pods.yaml
+kubectl get pods -o wide
+kubectl describe pod too-big
+kubectl apply -f examples/lifecycle/pods.yaml
+kubectl get pods -w
+kubectl get events --sort-by=.lastTimestamp
 ```
 
 | Flag | Default | Meaning |
@@ -34,6 +50,7 @@ go build -o kube-emulator ./cmd/kube-emulator
 | `--node-cpu`, `--node-memory`, `--node-pods` | `8`, `16Gi`, `110` | capacity of generated nodes (and default for nodes created without capacity) |
 | `--delays` | – | pod lifecycle delays, e.g. `pull=3s,ready=5s`, or `instant` |
 | `--seed-dir` | – | folder of manifests created at start-up when missing |
+| `--tui` | off | terminal UI with a live request/response inspector (see below) |
 | `-v` | off | dump every request (full headers and body) and log its duration |
 
 ## Project layout
@@ -54,6 +71,10 @@ kube-emulator/
     │   └── events.go
     ├── kubesim/             # fake nodes, scheduler, kubelet lifecycle simulation
     │   ├── nodes.go  scheduler.go  predicates.go  kubelet.go  delays.go  common.go
+    ├── trace/               # records every request/response (ring buffer) for the UI
+    │   └── trace.go
+    ├── tui/                 # terminal UI (--tui): Bubble Tea + Lip Gloss
+    │   ├── model.go  detail.go  format.go  filter.go  theme.go  logs.go  run.go
     ├── config/              # .env parsing and flag/env/.env precedence
     │   └── dotenv.go
     ├── openapi/             # swagger.json definitions -> OpenAPI v2 / v3 documents (kubectl explain)
@@ -143,6 +164,7 @@ line endings; see `.env.example` for every key.
 | `--node-pods` | `KUBE_EMULATOR_NODE_PODS` |
 | `--delays` | `KUBE_EMULATOR_DELAYS` |
 | `--seed-dir` | `KUBE_EMULATOR_SEED_DIR` |
+| `--tui` | `KUBE_EMULATOR_TUI` |
 | `-v` | `KUBE_EMULATOR_VERBOSE` |
 
 ## kubectl explain
@@ -261,16 +283,52 @@ from the controllers `ScalingReplicaSet`, `SuccessfulCreate`,
 aggregated (`count`, `lastTimestamp`), events expire after an hour, and
 `kubectl get pods -o wide` shows IP and node.
 
+## Terminal UI (`--tui`)
+
 ```bash
-./kube-emulator --nodes=3 --seed-dir=./examples/scheduling
-kubectl get nodes -o wide
-kubectl apply -f examples/scheduling/pods.yaml
-kubectl get pods -o wide
-kubectl describe pod too-big
-kubectl apply -f examples/lifecycle/pods.yaml
-kubectl get pods -w
-kubectl get events --sort-by=.lastTimestamp
+./kube-emulator --tui --nodes=3
 ```
+
+A full-screen inspector for everything that talks to the emulator. Use kubectl
+in another terminal and watch the traffic arrive. Quitting the UI (`q`) stops
+the emulator.
+
+```
+ ◆ KUBE·EMULATOR  API traffic inspector                    ● LIVE  http://127.0.0.1:8085
+ [m] METHOD ALL  [s] STATUS ALL  [d] DISCOVERY shown  [p] PAUSE off  [f] FOLLOW on  ⌕ filter…
+ ▁▂▃▅▇▅▃▂▁ 4.2 req/s │ 342 total │ ✓ 330 │ ⚠ 8 │ ✗ 4 │ avg 3ms          showing 120 of 342
+ ╭─ ⟡ Requests  120 ───────────────╮╭─ ◈ POST create pods · default ─────────────────────╮
+ │ WHEN     METHOD ST REQUEST  TOOK ││  1 Overview   2 Request   3 Response               │
+ │▍12:03:41 POST   201 create pods…││ ▌ RESULT                                           │
+ │▏12:03:41 GET    200 list pods   ││   kind  Pod        { "apiVersion": "v1", …         │
+ ╰─────────────────────────────────╯╰────────────────────────────────────────────────────╯
+```
+
+* **Left pane:** every request, newest last, with time, method, status and
+  duration. **Right pane:** the selected request in three tabs: *Overview*
+  (what Kubernetes operation it was, the result, query parameters, client,
+  watch event counts), *Request* (headers and body) and *Response* (status,
+  headers, body). JSON is pretty-printed and highlighted, watch streams are
+  split into events (`ADDED`, `MODIFIED`, ...) and update live, binary bodies
+  (the protobuf OpenAPI document) are shown as a hex dump.
+* **Toolbar:** clickable buttons for the method and status filters, hiding the
+  noisy API discovery / OpenAPI calls kubectl makes, pause, follow and clear,
+  plus a search box. A strip below shows requests per second, totals, errors
+  and average latency.
+* **Search syntax:** words must all match the method, path, summary or status;
+  `key:value` terms narrow it down (`method:` `status:` `verb:` `res:` `ns:`
+  `name:` `path:` `body:`); `-term` negates. Examples: `pods status:4xx`,
+  `-verb:watch ns:default`, `body:nginx`, `status:5xx`.
+* **Keys:** `↑ ↓ j k` move, `pgup pgdn` page, `g G` first/last, `tab` or
+  `← →` switch pane, `1 2 3` or `[ ]` switch tab, `/` search, `m` `s` `d` filters,
+  `x` reset filters, `p` pause, `f` follow, `c` clear, `e` `E` next/previous
+  error, `y` copy as a curl command, `Y` copy the response body, `l` server
+  log, `?` help, `q` quit. The mouse works too: click rows, tabs and buttons,
+  scroll with the wheel.
+* Copying uses the OSC 52 terminal escape (Windows Terminal, iTerm2, kitty,
+  WezTerm, tmux with `set-clipboard on`, ...). The UI needs a terminal with
+  Unicode and 64x14 cells or more; the last 2000 requests are kept and bodies
+  are cut at 256 KB.
 
 ## Using kubectl
 
