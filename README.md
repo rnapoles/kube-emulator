@@ -26,6 +26,8 @@ go build -o kube-emulator ./cmd/kube-emulator
 | `--storage` | `memory` | `memory` or `sqlite` |
 | `--sqlite-path` | `kube-emulator.db` | database file for `--storage=sqlite` |
 | `--write-kubeconfig` | – | also write a kubeconfig pointing at the server |
+| `--kinds-dir` | – | folder of CRD files; the kinds they define are served (see below) |
+| `--kinds-reload` | `2s` | how often the folder is re-scanned (`0` = only at start-up) |
 | `-v` | off | dump every request (full headers and body) and log its duration |
 
 ## Project layout
@@ -59,6 +61,36 @@ kube-emulator/
 
 Dependencies only point downwards: `main` -> `server`, `controllers` ->
 `objects` -> `registry` -> `store`.
+
+## Loading kinds from a folder (no code changes)
+
+Built-in kinds (Pod, Deployment, ...) are compiled in, but **any other kind can
+be added at run time with a CustomResourceDefinition file**:
+
+```bash
+./kube-emulator --kinds-dir=./examples/kinds
+kubectl api-resources | grep example.com
+kubectl apply -f examples/widget.yaml
+kubectl get widgets          # or: kubectl get wg
+kubectl apply -f examples/widget.yaml   # a Widget with spec.size: 99 is rejected by the CRD schema
+```
+
+* Put any number of `*.yaml`, `*.yml` or `*.json` files in the folder
+  (sub-folders are searched; multi-document files and `kind: List` work). Good
+  sources are `kubectl get crd <name> -o yaml` on a real cluster, or the
+  `config/crd/bases` folder of an operator repository.
+* The folder is read at start-up and re-scanned every `--kinds-reload`:
+  a new or changed file creates/updates the CRD and the kind is served
+  immediately; a deleted file (or a CRD removed from a file) deletes the CRD
+  and all of its resources. Only CRDs that came from the folder are pruned;
+  CRDs created with `kubectl` are left alone.
+* Files go through the same validation as a CRD sent by `kubectl`, and
+  resources are validated against the CRD's `openAPIV3Schema` (status
+  subresource and short names are honoured). Files with errors are logged and
+  skipped.
+* Other kinds of manifests in the folder are ignored. A folder cannot add new
+  *built-in* kinds or older API versions of built-in kinds, because those need
+  Go types for typed validation.
 
 ## Using kubectl
 

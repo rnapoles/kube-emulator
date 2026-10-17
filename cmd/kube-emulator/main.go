@@ -35,6 +35,8 @@ func main() {
 		dbPath   = flag.String("sqlite-path", "kube-emulator.db", "SQLite database file (used with --storage=sqlite)")
 		kubecfg  = flag.String("write-kubeconfig", "", "also write a kubeconfig that points at this server to the given file")
 		verbose  = flag.Bool("v", false, "verbose: dump every request (full headers and body) and log its duration")
+		kindsDir = flag.String("kinds-dir", "", "folder with CustomResourceDefinition files (YAML/JSON); the kinds they define are served without code changes")
+		kindsInt = flag.Duration("kinds-reload", 2*time.Second, "how often --kinds-dir is re-scanned for changes (0 = load once at start-up)")
 		showHelp = flag.Bool("h", false, "show help")
 	)
 	flag.Parse()
@@ -71,6 +73,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go controllers.New(st, ipam).Run(ctx)
+
+	if *kindsDir != "" {
+		loader := srv.NewKindsLoader(*kindsDir)
+		if err := loader.Sync(); err != nil {
+			log.Fatalf("loading kinds from %s: %v", *kindsDir, err)
+		}
+		if *kindsInt > 0 {
+			go loader.Watch(ctx, *kindsInt)
+		}
+		log.Printf("kinds: loading CustomResourceDefinitions from %s", *kindsDir)
+	}
 
 	host := *bind
 	addr := net.JoinHostPort(host, strconv.Itoa(*port))
