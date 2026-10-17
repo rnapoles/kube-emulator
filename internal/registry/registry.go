@@ -58,6 +58,7 @@ type Resource struct {
 	Typed                                bool // Go type registered in client-go's scheme
 	Custom                               bool // defined by a CustomResourceDefinition
 	Validator                            *validate.SchemaValidator
+	Schema                               map[string]interface{} // raw openAPIV3Schema of a custom kind
 }
 
 func (r *Resource) Key() ResourceKey { return ResourceKey{Group: r.Group, Resource: r.Name} }
@@ -298,6 +299,7 @@ func (g *Registry) RegisterCRD(u *U) error {
 		if sch, ok := vm["schema"].(map[string]interface{}); ok {
 			if oas, ok := sch["openAPIV3Schema"]; ok {
 				r.Validator = buildValidator(oas)
+				r.Schema, _ = oas.(map[string]interface{})
 			}
 		}
 		g.res = append(g.res, r)
@@ -331,9 +333,10 @@ func buildValidator(raw interface{}) *validate.SchemaValidator {
 	return validate.NewSchemaValidator(&sc, nil, "", strfmt.Default)
 }
 
-// ---- minimal OpenAPI v3 (enough for kubectl to detect server-side fieldValidation) ----
+// ---- OpenAPI v3 index (the documents themselves are built by the openapi package) ----
 
-func gvPath(group, version string) string {
+// GVPath is the OpenAPI v3 path key of a group/version ("api/v1", "apis/apps/v1").
+func GVPath(group, version string) string {
 	if group == "" {
 		return "api/" + version
 	}
@@ -345,45 +348,21 @@ func (g *Registry) OpenAPIV3Index() map[string]interface{} {
 	defer g.mu.RUnlock()
 	paths := map[string]interface{}{}
 	for _, r := range g.res {
-		key := gvPath(r.Group, r.Version)
+		key := GVPath(r.Group, r.Version)
 		paths[key] = map[string]interface{}{"serverRelativeURL": "/openapi/v3/" + key}
 	}
 	return map[string]interface{}{"paths": paths}
 }
 
-func (g *Registry) OpenAPIV3Doc(key string) map[string]interface{} {
+// ByPath returns the resources served under an OpenAPI v3 path key.
+func (g *Registry) ByPath(key string) []*Resource {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	paths := map[string]interface{}{}
-	found := false
+	var out []*Resource
 	for _, r := range g.res {
-		if gvPath(r.Group, r.Version) != key {
-			continue
+		if GVPath(r.Group, r.Version) == key {
+			out = append(out, r)
 		}
-		found = true
-		coll := "/" + key + "/" + r.Name
-		if r.Namespaced {
-			coll = "/" + key + "/namespaces/{namespace}/" + r.Name
-		}
-		op := func(action string) map[string]interface{} {
-			return map[string]interface{}{
-				"x-kubernetes-action":             action,
-				"x-kubernetes-group-version-kind": map[string]interface{}{"group": r.Group, "version": r.Version, "kind": r.Kind},
-				"parameters": []interface{}{map[string]interface{}{
-					"name": "fieldValidation", "in": "query", "schema": map[string]interface{}{"type": "string"},
-				}},
-				"responses": map[string]interface{}{"200": map[string]interface{}{"description": "OK"}},
-			}
-		}
-		paths[coll] = map[string]interface{}{"post": op("post")}
-		paths[coll+"/{name}"] = map[string]interface{}{"put": op("put"), "patch": op("patch")}
 	}
-	if !found {
-		return nil
-	}
-	return map[string]interface{}{
-		"openapi": "3.0.0",
-		"info":    map[string]interface{}{"title": "Kubernetes emulator", "version": ServerVersion},
-		"paths":   paths,
-	}
+	return out
 }

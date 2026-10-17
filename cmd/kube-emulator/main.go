@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -21,11 +22,26 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
+	"github.com/rnapoles/kube-emulator/internal/config"
 	"github.com/rnapoles/kube-emulator/internal/controllers"
 	"github.com/rnapoles/kube-emulator/internal/objects"
+	"github.com/rnapoles/kube-emulator/internal/openapi"
 	"github.com/rnapoles/kube-emulator/internal/server"
 	"github.com/rnapoles/kube-emulator/internal/store"
 )
+
+// flagEnvKeys maps each flag to the environment variable / .env key that sets it.
+var flagEnvKeys = map[string]string{
+	"bind-address":     "KUBE_EMULATOR_BIND_ADDRESS",
+	"port":             "KUBE_EMULATOR_PORT",
+	"storage":          "KUBE_EMULATOR_STORAGE",
+	"sqlite-path":      "KUBE_EMULATOR_SQLITE_PATH",
+	"write-kubeconfig": "KUBE_EMULATOR_WRITE_KUBECONFIG",
+	"kinds-dir":        "KUBE_EMULATOR_KINDS_DIR",
+	"kinds-reload":     "KUBE_EMULATOR_KINDS_RELOAD",
+	"openapi-spec":     "KUBE_EMULATOR_OPENAPI_SPEC",
+	"v":                "KUBE_EMULATOR_VERBOSE",
+}
 
 func main() {
 	var (
@@ -37,12 +53,33 @@ func main() {
 		verbose  = flag.Bool("v", false, "verbose: dump every request (full headers and body) and log its duration")
 		kindsDir = flag.String("kinds-dir", "", "folder with CustomResourceDefinition files (YAML/JSON); the kinds they define are served without code changes")
 		kindsInt = flag.Duration("kinds-reload", 2*time.Second, "how often --kinds-dir is re-scanned for changes (0 = load once at start-up)")
+		specPath = flag.String("openapi-spec", "", "swagger.json (OpenAPI v2) whose definitions are served so that `kubectl explain` works for built-in kinds")
+		envFile  = flag.String("env-file", ".env", "file with default settings (KUBE_EMULATOR_*=value); command line flags take precedence")
 		showHelp = flag.Bool("h", false, "show help")
 	)
 	flag.Parse()
 	if *showHelp {
 		flag.Usage()
 		return
+	}
+
+	// Defaults from the .env file and the environment. Flags given on the
+	// command line always win, so they are skipped here.
+	cli := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { cli[f.Name] = true })
+	dotenv, err := config.LoadFile(*envFile)
+	if err != nil {
+		if cli["env-file"] || !errors.Is(err, fs.ErrNotExist) {
+			log.Fatalf("reading env file: %v", err)
+		}
+		dotenv = nil // no .env next to us: nothing to load
+	}
+	applied, err := config.Apply(flag.CommandLine, flagEnvKeys, dotenv, cli)
+	if err != nil {
+		log.Fatalf("configuration: %v", err)
+	}
+	for _, a := range applied {
+		log.Printf("config: %s", a)
 	}
 
 	var persister store.Persister
@@ -66,6 +103,14 @@ func main() {
 
 	ipam := objects.NewIPAM(st.CurrentRV())
 	srv := server.New(st, ipam, *verbose)
+	if *specPath != "" {
+		spec, err := openapi.Load(*specPath)
+		if err != nil {
+			log.Fatalf("loading --openapi-spec: %v", err)
+		}
+		srv.SetOpenAPI(spec)
+		log.Printf("openapi: loaded %d definitions from %s", spec.NumDefinitions(), *specPath)
+	}
 	if err := controllers.Bootstrap(st, ipam, *port); err != nil {
 		log.Fatalf("bootstrapping cluster objects: %v", err)
 	}

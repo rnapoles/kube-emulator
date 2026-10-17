@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/rnapoles/kube-emulator/internal/objects"
+	"github.com/rnapoles/kube-emulator/internal/openapi"
 	"github.com/rnapoles/kube-emulator/internal/registry"
 	"github.com/rnapoles/kube-emulator/internal/store"
 )
@@ -42,7 +43,11 @@ type Server struct {
 	lenient serializer.CodecFactory
 	ipam    *objects.IPAM
 	verbose bool
+	oapi    *openapi.Spec // optional swagger.json definitions (kubectl explain)
 }
+
+// SetOpenAPI makes the definitions of a swagger.json available to kubectl.
+func (s *Server) SetOpenAPI(sp *openapi.Spec) { s.oapi = sp }
 
 // New creates the emulated API server.
 func New(st *store.Store, ipam *objects.IPAM, verbose bool) *Server {
@@ -158,7 +163,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "openapi/v3":
 		writeJSON(w, 200, s.reg.OpenAPIV3Index())
 	case strings.HasPrefix(p, "openapi/v3/"):
-		if doc := s.reg.OpenAPIV3Doc(strings.TrimPrefix(p, "openapi/v3/")); doc != nil {
+		if doc := openapi.V3Doc(s.oapi, s.reg, strings.TrimPrefix(p, "openapi/v3/")); doc != nil {
 			writeJSON(w, 200, doc)
 		} else {
 			writeError(w, errNotFoundPath())
@@ -182,6 +187,16 @@ func (s *Server) openAPIV2(w http.ResponseWriter, r *http.Request) {
 	// NOTE: the Accept header uses "@v1.0", but a response Content-Type must not
 	// contain "@" (client-go would fail with "mime: unexpected content after media
 	// subtype"), so the response uses "." like the real API server.
+	if s.oapi != nil {
+		if strings.Contains(r.Header.Get("Accept"), "protobuf") {
+			w.Header().Set("Content-Type", "application/com.github.proto-openapi.spec.v2.v1.0+protobuf")
+			_, _ = w.Write(s.oapi.Protobuf())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(s.oapi.JSON())
+		return
+	}
 	doc := []byte(`{"swagger":"2.0","info":{"title":"Kubernetes emulator","version":"` + registry.ServerVersion + `"},"paths":{},"definitions":{}}`)
 	if strings.Contains(r.Header.Get("Accept"), "protobuf") {
 		d, err := openapi_v2.ParseDocument(doc)
